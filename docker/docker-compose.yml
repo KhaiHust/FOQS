@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  mysql-shard-0:
+    image: mysql:8.0
+    container_name: foqs-mysql-shard-0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: foqs_shard_0
+    ports:
+      - "3306:3306"
+    command: --default-authentication-plugin=mysql_native_password
