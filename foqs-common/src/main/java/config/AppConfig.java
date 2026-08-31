@@ -45,7 +45,7 @@ public class AppConfig {
         return properties.getProperty(key, defaultValue);
     }
 
-    private static int getIntProperty(String propertyName, int defaultValue) {
+    public static int getIntProperty(String propertyName, int defaultValue) {
         String value = properties.getProperty(propertyName);
         if (value != null) {
             return Integer.parseInt(value);
