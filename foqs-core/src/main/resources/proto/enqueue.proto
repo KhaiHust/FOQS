@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package project.khaihust.foqs.core.proto;
+
+option java_multiple_files = true;
+option java_package = "project.khaihust.foqs.core.proto";
+option java_outer_classname = "EnqueueProto";
+
+service EnqueueService {
+  rpc Enqueue (EnqueueRequestDto) returns (EnqueueResponseDto);
+}
+
+message EnqueueRequestDto {
+  string topic = 1;
+  int32 priority = 2;
+  bytes payload = 3;
+  int64 deliver_after = 4;
+}
+
+message EnqueueResponseDto {
+  string message_id = 1;
+}

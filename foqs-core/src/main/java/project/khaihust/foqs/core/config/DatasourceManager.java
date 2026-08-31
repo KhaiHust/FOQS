@@ -4,23 +4,24 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import config.AppConfig;
 import config.ShardConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.logging.Logger;
 
 public class DatasourceManager implements AutoCloseable {
-    private static final Logger logger = Logger.getLogger(DatasourceManager.class.getName());
+    private static final Logger logger = LoggerFactory.getLogger(DatasourceManager.class);
     private final Map<Integer, HikariDataSource> shardDatasources = new HashMap<>();
 
     public DatasourceManager(List<ShardConfig> shardConfigs) {
         for (ShardConfig shardConfig : shardConfigs) {
             var dataSource = createShardDataSource(shardConfig);
             shardDatasources.put(shardConfig.getShardId(), dataSource);
-            logger.info("Initialized datasource for shard: " + shardConfig.getShardId());
+            logger.info("Initialized datasource for shard: {}", shardConfig.getShardId());
         }
     }
 
@@ -73,9 +74,9 @@ public class DatasourceManager implements AutoCloseable {
         for (Map.Entry<Integer, HikariDataSource> entry : shardDatasources.entrySet()) {
             try {
                 entry.getValue().close();
-                logger.info("Closed datasource for shard: " + entry.getKey());
+                logger.info("Closed datasource for shard: {}", entry.getKey());
             } catch (Exception e) {
-                logger.severe("Error closing datasource for shard: " + entry.getKey() + ". Error: " + e.getMessage());
+                logger.error("Error closing datasource for shard: {}", entry.getKey(), e);
             }
         }
     }

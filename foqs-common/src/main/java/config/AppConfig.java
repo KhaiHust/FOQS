@@ -14,16 +14,17 @@ public class AppConfig {
     private static final String ACTIVE_PROFILE;
 
     static {
+        loadPropertiesFile("application.properties");
+
         String sysProp = System.getProperty("foqs.profile");
         String envVar = System.getenv("FOQS_PROFILE");
+        String propFileProfile = properties.getProperty("foqs.profile");
         ACTIVE_PROFILE = (sysProp != null && !sysProp.isBlank()) ? sysProp
                 : (envVar != null && !envVar.isBlank()) ? envVar
-                  : "local";
+                : (propFileProfile != null && !propFileProfile.isBlank()) ? propFileProfile
+                : "local";
 
         logger.info("Initializing FOQS with profile: [{}]", ACTIVE_PROFILE);
-
-
-        loadPropertiesFile("application.properties");
 
         loadPropertiesFile("application-" + ACTIVE_PROFILE + ".properties");
     }

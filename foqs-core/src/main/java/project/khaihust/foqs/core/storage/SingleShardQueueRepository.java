@@ -1,5 +1,6 @@
 package project.khaihust.foqs.core.storage;
 
+import com.fasterxml.uuid.impl.UUIDUtil;
 import lombok.RequiredArgsConstructor;
 import project.khaihust.foqs.core.models.EnqueueTask;
 
@@ -14,13 +15,17 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
 
     @Override
     public void enqueueBatch(List<EnqueueTask> enqueueTasks) throws SQLException {
+        if (enqueueTasks == null || enqueueTasks.isEmpty()) {
+            return;
+        }
+
         var sql = "INSERT INTO queue_messages (id, topic, priority, payload, deliver_after) " +
                 "VALUES (?, ?, ?, ?, ?)";
 
         try (var connection = dataSource.getConnection();
              var preparedStatement = connection.prepareStatement(sql)) {
             for (var task : enqueueTasks) {
-                preparedStatement.setObject(1, task.getMessageId());
+                preparedStatement.setBytes(1, UUIDUtil.asByteArray(task.getMessageId()));
                 preparedStatement.setString(2, task.getEnqueueRequest().getTopic());
                 preparedStatement.setInt(3, task.getEnqueueRequest().getPriority());
                 preparedStatement.setBytes(4, task.getEnqueueRequest().getPayload());

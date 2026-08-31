@@ -24,7 +24,6 @@
         <mysql.version>8.3.0</mysql.version>
         <liquibase.version>4.27.0</liquibase.version>
         <hikaricp.version>7.0.2</hikaricp.version>
-        <grpc.version>1.62.2</grpc.version>
         <protobuf.version>3.25.3</protobuf.version>
         <slf4j.version>2.0.12</slf4j.version>
         <logback.version>1.5.3</logback.version>
@@ -34,6 +33,7 @@
         <mockito.version>5.11.0</mockito.version>
         <h2.version>2.2.224</h2.version>
         <java-uuid-generator.version>5.1.0</java-uuid-generator.version>
+        <grpc.version>1.82.4</grpc.version>
     </properties>
 
     <dependencies>
@@ -58,6 +58,13 @@
     </dependencies>
 
     <build>
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>1.7.1</version>
+            </extension>
+        </extensions>
         <pluginManagement>
             <plugins>
                 <plugin>
@@ -75,6 +82,11 @@
                             </path>
                         </annotationProcessorPaths>
                     </configuration>
+                </plugin>
+                <plugin>
+                    <groupId>org.xolstice.maven.plugins</groupId>
+                    <artifactId>protobuf-maven-plugin</artifactId>
+                    <version>0.6.1</version>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
