@@ -16,10 +16,11 @@ import project.khaihust.foqs.core.buffer.IPrefetchBatch;
 import project.khaihust.foqs.core.buffer.IPrefetchBufferRegistry;
 import project.khaihust.foqs.core.enums.MessageStatus;
 import project.khaihust.foqs.core.models.Message;
-import project.khaihust.foqs.core.proto.DequeueRequestDto;
-import project.khaihust.foqs.core.proto.DequeueResponseDto;
+import project.khaihust.foqs.core.proto.*;
+import project.khaihust.foqs.core.storage.ISingleShardQueueRepository;
 
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -28,6 +29,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -43,10 +45,25 @@ class DequeueServiceTest {
     private IPrefetchBatch prefetchBatch;
 
     @Mock
+    private ISingleShardQueueRepository singleShardQueueRepository;
+
+    @Mock
     private StreamObserver<DequeueResponseDto> responseObserver;
+
+    @Mock
+    private StreamObserver<BatchAckResponseDto> batchAckResponseObserver;
+
+    @Mock
+    private StreamObserver<BatchNackResponseDto> batchNackResponseObserver;
 
     @Captor
     private ArgumentCaptor<DequeueResponseDto> responseCaptor;
+
+    @Captor
+    private ArgumentCaptor<BatchAckResponseDto> batchAckResponseCaptor;
+
+    @Captor
+    private ArgumentCaptor<BatchNackResponseDto> batchNackResponseCaptor;
 
     @Captor
     private ArgumentCaptor<Throwable> errorCaptor;
@@ -55,7 +72,7 @@ class DequeueServiceTest {
 
     @BeforeEach
     void setUp() {
-        dequeueService = new DequeueService(prefetchBufferRegistry);
+        dequeueService = new DequeueService(prefetchBufferRegistry, singleShardQueueRepository);
     }
 
     @Test
@@ -194,6 +211,186 @@ class DequeueServiceTest {
         verify(responseObserver).onError(errorCaptor.capture());
         verify(responseObserver, never()).onNext(any());
         verify(responseObserver, never()).onCompleted();
+
+        Throwable error = errorCaptor.getValue();
+        assertThat(error).isInstanceOf(StatusRuntimeException.class);
+        StatusRuntimeException sre = (StatusRuntimeException) error;
+        assertThat(sre.getStatus().getCode()).isEqualTo(Status.Code.INTERNAL);
+    }
+
+    @Test
+    @DisplayName("Should successfully batch ack messages and populate ackedMessageIds in response")
+    void testBatchAck_Success() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        UUID id2 = UUID.randomUUID();
+        when(singleShardQueueRepository.ackMessages(List.of(id1, id2))).thenReturn(List.of(id1, id2));
+
+        BatchAckRequestDto request = BatchAckRequestDto.newBuilder()
+                .addAllMessageIds(List.of(id1.toString(), id2.toString()))
+                .build();
+
+        dequeueService.batchAck(request, batchAckResponseObserver);
+
+        verify(batchAckResponseObserver).onNext(batchAckResponseCaptor.capture());
+        verify(batchAckResponseObserver).onCompleted();
+        verify(batchAckResponseObserver, never()).onError(any());
+
+        BatchAckResponseDto response = batchAckResponseCaptor.getValue();
+        assertThat(response.getAckedMessageIdsList()).containsExactlyInAnyOrder(id1.toString(), id2.toString());
+        assertThat(response.getFailedMessageIdsList()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should handle partial failure in batch ack and populate both acked and failed message IDs")
+    void testBatchAck_PartialFailure() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        UUID id2 = UUID.randomUUID();
+        UUID id3 = UUID.randomUUID();
+        when(singleShardQueueRepository.ackMessages(List.of(id1, id2, id3))).thenReturn(List.of(id1, id3));
+
+        BatchAckRequestDto request = BatchAckRequestDto.newBuilder()
+                .addAllMessageIds(List.of(id1.toString(), id2.toString(), id3.toString()))
+                .build();
+
+        dequeueService.batchAck(request, batchAckResponseObserver);
+
+        verify(batchAckResponseObserver).onNext(batchAckResponseCaptor.capture());
+        verify(batchAckResponseObserver).onCompleted();
+        verify(batchAckResponseObserver, never()).onError(any());
+
+        BatchAckResponseDto response = batchAckResponseCaptor.getValue();
+        assertThat(response.getAckedMessageIdsList()).containsExactlyInAnyOrder(id1.toString(), id3.toString());
+        assertThat(response.getFailedMessageIdsList()).containsExactly(id2.toString());
+    }
+
+    @Test
+    @DisplayName("Should return INVALID_ARGUMENT on batch ack when message IDs contains invalid UUID")
+    void testBatchAck_InvalidUuids() {
+        BatchAckRequestDto request = BatchAckRequestDto.newBuilder()
+                .addAllMessageIds(List.of("not-a-valid-uuid"))
+                .build();
+
+        dequeueService.batchAck(request, batchAckResponseObserver);
+
+        verify(batchAckResponseObserver).onError(errorCaptor.capture());
+        verify(batchAckResponseObserver, never()).onNext(any());
+        verify(batchAckResponseObserver, never()).onCompleted();
+
+        Throwable error = errorCaptor.getValue();
+        assertThat(error).isInstanceOf(StatusRuntimeException.class);
+        StatusRuntimeException sre = (StatusRuntimeException) error;
+        assertThat(sre.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+        assertThat(sre.getStatus().getDescription()).contains("One or more message IDs are invalid UUIDs");
+    }
+
+    @Test
+    @DisplayName("Should return INTERNAL on batch ack when repository throws exception")
+    void testBatchAck_RepositoryException() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        when(singleShardQueueRepository.ackMessages(any())).thenThrow(new SQLException("Database failure"));
+
+        BatchAckRequestDto request = BatchAckRequestDto.newBuilder()
+                .addMessageIds(id1.toString())
+                .build();
+
+        dequeueService.batchAck(request, batchAckResponseObserver);
+
+        verify(batchAckResponseObserver).onError(errorCaptor.capture());
+        verify(batchAckResponseObserver, never()).onNext(any());
+        verify(batchAckResponseObserver, never()).onCompleted();
+
+        Throwable error = errorCaptor.getValue();
+        assertThat(error).isInstanceOf(StatusRuntimeException.class);
+        StatusRuntimeException sre = (StatusRuntimeException) error;
+        assertThat(sre.getStatus().getCode()).isEqualTo(Status.Code.INTERNAL);
+    }
+
+    @Test
+    @DisplayName("Should successfully batch nack messages with custom retry delay and max retries")
+    void testBatchNack_Success() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        UUID id2 = UUID.randomUUID();
+        when(singleShardQueueRepository.nackMessages(List.of(id1, id2), 3000L, 4)).thenReturn(2);
+
+        BatchNackRequestDto request = BatchNackRequestDto.newBuilder()
+                .addAllMessageIds(List.of(id1.toString(), id2.toString()))
+                .setRetryDelayMs(3000L)
+                .setMaxRetryCount(4)
+                .build();
+
+        dequeueService.batchNack(request, batchNackResponseObserver);
+
+        verify(batchNackResponseObserver).onNext(batchNackResponseCaptor.capture());
+        verify(batchNackResponseObserver).onCompleted();
+        verify(batchNackResponseObserver, never()).onError(any());
+
+        BatchNackResponseDto response = batchNackResponseCaptor.getValue();
+        assertThat(response.getSuccessCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("Should fallback to DEFAULT_MAX_RETRIES when maxRetryCount is 0 or negative")
+    void testBatchNack_FallbackToDefaultMaxRetries() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        when(singleShardQueueRepository.nackMessages(List.of(id1), 0L, 5)).thenReturn(1);
+
+        BatchNackRequestDto request = BatchNackRequestDto.newBuilder()
+                .addMessageIds(id1.toString())
+                .setRetryDelayMs(0L)
+                .setMaxRetryCount(0)
+                .build();
+
+        dequeueService.batchNack(request, batchNackResponseObserver);
+
+        verify(singleShardQueueRepository).nackMessages(List.of(id1), 0L, 5);
+        verify(batchNackResponseObserver).onNext(batchNackResponseCaptor.capture());
+        verify(batchNackResponseObserver).onCompleted();
+        verify(batchNackResponseObserver, never()).onError(any());
+
+        BatchNackResponseDto response = batchNackResponseCaptor.getValue();
+        assertThat(response.getSuccessCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("Should return INVALID_ARGUMENT on batch nack when message IDs contains invalid UUID")
+    void testBatchNack_InvalidUuids() {
+        BatchNackRequestDto request = BatchNackRequestDto.newBuilder()
+                .addMessageIds("not-a-valid-uuid")
+                .setRetryDelayMs(1000L)
+                .setMaxRetryCount(3)
+                .build();
+
+        dequeueService.batchNack(request, batchNackResponseObserver);
+
+        verify(batchNackResponseObserver).onError(errorCaptor.capture());
+        verify(batchNackResponseObserver, never()).onNext(any());
+        verify(batchNackResponseObserver, never()).onCompleted();
+
+        Throwable error = errorCaptor.getValue();
+        assertThat(error).isInstanceOf(StatusRuntimeException.class);
+        StatusRuntimeException sre = (StatusRuntimeException) error;
+        assertThat(sre.getStatus().getCode()).isEqualTo(Status.Code.INVALID_ARGUMENT);
+        assertThat(sre.getStatus().getDescription()).contains("One or more message IDs are invalid UUIDs");
+    }
+
+    @Test
+    @DisplayName("Should return INTERNAL on batch nack when repository throws exception")
+    void testBatchNack_RepositoryException() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        when(singleShardQueueRepository.nackMessages(any(), anyLong(), anyInt()))
+                .thenThrow(new RuntimeException("Storage failure"));
+
+        BatchNackRequestDto request = BatchNackRequestDto.newBuilder()
+                .addMessageIds(id1.toString())
+                .setRetryDelayMs(1000L)
+                .setMaxRetryCount(3)
+                .build();
+
+        dequeueService.batchNack(request, batchNackResponseObserver);
+
+        verify(batchNackResponseObserver).onError(errorCaptor.capture());
+        verify(batchNackResponseObserver, never()).onNext(any());
+        verify(batchNackResponseObserver, never()).onCompleted();
 
         Throwable error = errorCaptor.getValue();
         assertThat(error).isInstanceOf(StatusRuntimeException.class);

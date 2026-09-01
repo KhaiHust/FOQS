@@ -15,4 +15,6 @@ public interface ISingleShardQueueRepository {
     void enqueueBatch(List<EnqueueTask> enqueueTasks) throws SQLException;
     List<Message> leaseMessages(String topic, int batchLimit, Duration leaseDuration) throws SQLException;
     int reclaimExpiredLeases() throws SQLException;
+    List<UUID> ackMessages(List<UUID> messageIds) throws SQLException;
+    int nackMessages(List<UUID> messageIds, long retryDelayMs, int maxRetries) throws SQLException;
 }

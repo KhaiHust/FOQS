@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 
 @RequiredArgsConstructor
 public class SingleShardQueueRepository implements ISingleShardQueueRepository {
@@ -133,5 +134,79 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
         }
     }
 
+    @Override
+    public List<UUID> ackMessages(List<UUID> messageIds) throws SQLException {
+        if (messageIds == null || messageIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        String placeholders = String.join(",", Collections.nCopies(messageIds.size(), "?"));
+        String selectSql = "SELECT id FROM queue_messages WHERE status = 1 AND id IN (" + placeholders + ") FOR UPDATE";
+
+        List<UUID> acked = new ArrayList<>();
+        try (var conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+
+            try (var psSelect = conn.prepareStatement(selectSql)) {
+                for (int i = 0; i < messageIds.size(); i++) {
+                    psSelect.setBytes(i + 1, UUIDUtil.asByteArray(messageIds.get(i)));
+                }
+                try (var rs = psSelect.executeQuery()) {
+                    while (rs.next()) {
+                        acked.add(UUIDUtil.uuid(rs.getBytes("id")));
+                    }
+                }
+            }
+
+            if (!acked.isEmpty()) {
+                String updatePlaceholders = String.join(",", Collections.nCopies(acked.size(), "?"));
+                String updateSql = "UPDATE queue_messages SET status = 2, lease_until = NULL WHERE id IN (" + updatePlaceholders + ")";
+                try (var psUpdate = conn.prepareStatement(updateSql)) {
+                    for (int i = 0; i < acked.size(); i++) {
+                        psUpdate.setBytes(i + 1, UUIDUtil.asByteArray(acked.get(i)));
+                    }
+                    psUpdate.executeUpdate();
+                }
+            }
+
+            conn.commit();
+        }
+        return acked;
+    }
+
+    @Override
+    public int nackMessages(List<UUID> messageIds, long retryDelayMs, int maxRetries) throws SQLException {
+        if (messageIds == null || messageIds.isEmpty()) {
+            return 0;
+        }
+
+        var nextDelivery = Instant.now().plusMillis(Math.max(0, retryDelayMs));
+        var placeholders = String.join(",", Collections.nCopies(messageIds.size(), "?"));
+
+        var sql = """
+            UPDATE queue_messages
+            SET status = CASE 
+                            WHEN retry_count + 1 >= ? THEN 3 
+                            ELSE 0 
+                         END,
+                lease_until = NULL,
+                deliver_after = ?,
+                retry_count = retry_count + 1
+            WHERE status = 1 AND id IN (
+        """ + placeholders + ")";
+
+        try (var conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(sql)) {
+
+            ps.setInt(1, maxRetries);
+            ps.setTimestamp(2, Timestamp.from(nextDelivery));
+
+            for (int i = 0; i < messageIds.size(); i++) {
+                ps.setBytes(i + 3, UUIDUtil.asByteArray(messageIds.get(i)));
+            }
+
+            return ps.executeUpdate();
+        }
+    }
 
 }

@@ -9,17 +9,14 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import project.khaihust.foqs.core.Application;
-import project.khaihust.foqs.core.proto.DequeueRequestDto;
-import project.khaihust.foqs.core.proto.DequeueResponseDto;
-import project.khaihust.foqs.core.proto.DequeueServiceGrpc;
-import project.khaihust.foqs.core.proto.DequeuedMessageDto;
-import project.khaihust.foqs.core.proto.EnqueueRequestDto;
-import project.khaihust.foqs.core.proto.EnqueueResponseDto;
-import project.khaihust.foqs.core.proto.EnqueueServiceGrpc;
+import com.fasterxml.uuid.impl.UUIDUtil;
+import project.khaihust.foqs.core.proto.*;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
@@ -324,5 +321,184 @@ public class EnqueueDequeueIntegrationTest {
 
         assertThat(dequeuedIds).hasSize(totalMessages);
         assertThat(dequeuedIds).containsExactlyInAnyOrderElementsOf(enqueuedIds);
+    }
+
+    @Test
+    @DisplayName("Full Flow a: Enqueue -> Dequeue -> BatchAck -> Verify completed (status=2) and subsequent Dequeue empty")
+    void testFullFlow_EnqueueDequeueBatchAck() throws Exception {
+        String topic = "ack-flow-topic";
+        byte[] payloadBytes = "ack-flow-payload".getBytes(StandardCharsets.UTF_8);
+
+        // 1. Enqueue
+        EnqueueResponseDto enqueueResponse = enqueueStub.enqueue(EnqueueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setPriority(1)
+                .setPayload(ByteString.copyFrom(payloadBytes))
+                .setDeliverAfter(System.currentTimeMillis())
+                .build());
+
+        String messageId = enqueueResponse.getMessageId();
+        assertThat(messageId).isNotBlank();
+
+        // 2. Dequeue
+        DequeueResponseDto dequeueResponse = dequeueStub.dequeue(DequeueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setCount(1)
+                .setTimeout(3000)
+                .build());
+
+        assertThat(dequeueResponse.getMessagesCount()).isEqualTo(1);
+        assertThat(dequeueResponse.getMessages(0).getMessageId()).isEqualTo(messageId);
+
+        // 3. BatchAck
+        BatchAckResponseDto ackResponse = dequeueStub.batchAck(BatchAckRequestDto.newBuilder()
+                .addMessageIds(messageId)
+                .build());
+
+        assertThat(ackResponse.getAckedMessageIdsList()).containsExactly(messageId);
+        assertThat(ackResponse.getFailedMessageIdsList()).isEmpty();
+
+        // 4. Verify in DB: status = 2 (COMPLETED), lease_until is NULL
+        try (Connection conn = DriverManager.getConnection(JDBC_URL, DB_USER, DB_PASSWORD);
+             PreparedStatement ps = conn.prepareStatement("SELECT status, lease_until FROM queue_messages WHERE id = ?")) {
+            ps.setBytes(1, UUIDUtil.asByteArray(UUID.fromString(messageId)));
+            try (ResultSet rs = ps.executeQuery()) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getInt("status")).isEqualTo(2);
+                assertThat(rs.getTimestamp("lease_until")).isNull();
+            }
+        }
+
+        // 5. Subsequent Dequeue returns empty
+        DequeueResponseDto subsequentDequeue = dequeueStub.dequeue(DequeueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setCount(1)
+                .setTimeout(300)
+                .build());
+
+        assertThat(subsequentDequeue.getMessagesList()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Full Flow b: Enqueue -> Dequeue -> BatchNack (retryDelay=0) -> Dequeue again -> Verify retryCount=1 and matching payload/id")
+    void testFullFlow_EnqueueDequeueBatchNack_Retry() {
+        String topic = "nack-retry-flow-topic";
+        byte[] payloadBytes = "nack-retry-payload".getBytes(StandardCharsets.UTF_8);
+
+        // 1. Enqueue
+        EnqueueResponseDto enqueueResponse = enqueueStub.enqueue(EnqueueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setPriority(1)
+                .setPayload(ByteString.copyFrom(payloadBytes))
+                .setDeliverAfter(System.currentTimeMillis())
+                .build());
+
+        String messageId = enqueueResponse.getMessageId();
+
+        // 2. Dequeue
+        DequeueResponseDto firstDequeue = dequeueStub.dequeue(DequeueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setCount(1)
+                .setTimeout(3000)
+                .build());
+
+        assertThat(firstDequeue.getMessagesCount()).isEqualTo(1);
+        assertThat(firstDequeue.getMessages(0).getMessageId()).isEqualTo(messageId);
+        assertThat(firstDequeue.getMessages(0).getRetryCount()).isEqualTo(0);
+
+        // 3. BatchNack with retryDelay=0 and maxRetryCount=3
+        BatchNackResponseDto nackResponse = dequeueStub.batchNack(BatchNackRequestDto.newBuilder()
+                .addMessageIds(messageId)
+                .setRetryDelayMs(0L)
+                .setMaxRetryCount(3)
+                .build());
+
+        assertThat(nackResponse.getSuccessCount()).isEqualTo(1);
+
+        // 4. Dequeue again -> message is immediately re-deliverable
+        DequeueResponseDto secondDequeue = dequeueStub.dequeue(DequeueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setCount(1)
+                .setTimeout(3000)
+                .build());
+
+        assertThat(secondDequeue.getMessagesCount()).isEqualTo(1);
+        DequeuedMessageDto reDequeuedMsg = secondDequeue.getMessages(0);
+        assertThat(reDequeuedMsg.getMessageId()).isEqualTo(messageId);
+        assertThat(reDequeuedMsg.getTopic()).isEqualTo(topic);
+        assertThat(reDequeuedMsg.getRetryCount()).isEqualTo(1);
+        assertThat(reDequeuedMsg.getPayload().toByteArray()).isEqualTo(payloadBytes);
+    }
+
+    @Test
+    @DisplayName("Full Flow c: Enqueue -> Dequeue -> BatchNack (exceeding maxRetries) -> Verify status=3 (DEAD_LETTER) in DB and subsequent Dequeue empty")
+    void testFullFlow_EnqueueDequeueBatchNack_DeadLetter() throws Exception {
+        String topic = "nack-dlq-flow-topic";
+        byte[] payloadBytes = "nack-dlq-payload".getBytes(StandardCharsets.UTF_8);
+
+        // 1. Enqueue
+        EnqueueResponseDto enqueueResponse = enqueueStub.enqueue(EnqueueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setPriority(1)
+                .setPayload(ByteString.copyFrom(payloadBytes))
+                .setDeliverAfter(System.currentTimeMillis())
+                .build());
+
+        String messageId = enqueueResponse.getMessageId();
+
+        // 2. Dequeue
+        DequeueResponseDto dequeueResponse = dequeueStub.dequeue(DequeueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setCount(1)
+                .setTimeout(3000)
+                .build());
+
+        assertThat(dequeueResponse.getMessagesCount()).isEqualTo(1);
+        assertThat(dequeueResponse.getMessages(0).getMessageId()).isEqualTo(messageId);
+
+        // 3. BatchNack exceeding maxRetries (maxRetryCount = 1, current retry_count 0 -> 0 + 1 >= 1 -> DEAD_LETTER)
+        BatchNackResponseDto nackResponse = dequeueStub.batchNack(BatchNackRequestDto.newBuilder()
+                .addMessageIds(messageId)
+                .setRetryDelayMs(0L)
+                .setMaxRetryCount(1)
+                .build());
+
+        assertThat(nackResponse.getSuccessCount()).isEqualTo(1);
+
+        // 4. Verify in DB: status = 3 (DEAD_LETTER) and retry_count = 1
+        try (Connection conn = DriverManager.getConnection(JDBC_URL, DB_USER, DB_PASSWORD);
+             PreparedStatement ps = conn.prepareStatement("SELECT status, retry_count, lease_until FROM queue_messages WHERE id = ?")) {
+            ps.setBytes(1, UUIDUtil.asByteArray(UUID.fromString(messageId)));
+            try (ResultSet rs = ps.executeQuery()) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getInt("status")).isEqualTo(3); // DEAD_LETTER
+                assertThat(rs.getInt("retry_count")).isEqualTo(1);
+                assertThat(rs.getTimestamp("lease_until")).isNull();
+            }
+        }
+
+        // 5. Subsequent Dequeue returns empty
+        DequeueResponseDto subsequentDequeue = dequeueStub.dequeue(DequeueRequestDto.newBuilder()
+                .setTopic(topic)
+                .setCount(1)
+                .setTimeout(300)
+                .build());
+
+        assertThat(subsequentDequeue.getMessagesList()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Full Flow d: BatchAck with unknown UUIDs -> Verify response contains them in failedMessageIds")
+    void testFullFlow_BatchAck_UnknownUuids() {
+        String unknown1 = UUID.randomUUID().toString();
+        String unknown2 = UUID.randomUUID().toString();
+
+        BatchAckResponseDto response = dequeueStub.batchAck(BatchAckRequestDto.newBuilder()
+                .addMessageIds(unknown1)
+                .addMessageIds(unknown2)
+                .build());
+
+        assertThat(response.getAckedMessageIdsList()).isEmpty();
+        assertThat(response.getFailedMessageIdsList()).containsExactlyInAnyOrder(unknown1, unknown2);
     }
 }

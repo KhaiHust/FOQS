@@ -116,7 +116,7 @@ public class Application {
         );
 
         this.enqueueService = new EnqueueService(this.producerBatch);
-        this.dequeueService = new DequeueService(this.prefetchBufferRegistry);
+        this.dequeueService = new DequeueService(this.prefetchBufferRegistry, singleShardQueueRepository);
 
         this.server = ServerBuilder.forPort(port)
                 .addService(this.enqueueService)

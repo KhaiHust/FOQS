@@ -8,6 +8,8 @@ option java_outer_classname = "DequeueProto";
 
 service DequeueService {
   rpc Dequeue (DequeueRequestDto) returns (DequeueResponseDto);
+  rpc BatchAck(BatchAckRequestDto) returns (BatchAckResponseDto);
+  rpc BatchNack(BatchNackRequestDto) returns (BatchNackResponseDto);
 }
 
 message DequeueRequestDto {
@@ -28,4 +30,23 @@ message DequeuedMessageDto {
   int64 lease_until_epoch_ms = 5;
   int32 retry_count = 6;
   int64 created_at_epoch_ms = 7;
+}
+
+message BatchAckRequestDto {
+  repeated string message_ids = 1;
+}
+
+message BatchAckResponseDto {
+  repeated string acked_message_ids = 1;
+  repeated string failed_message_ids = 2;
+}
+
+message BatchNackRequestDto {
+  repeated string message_ids = 1;
+  int64 retry_delay_ms = 2;
+  int32 max_retry_count = 3;
+}
+
+message BatchNackResponseDto {
+  int32 successCount = 1;
 }

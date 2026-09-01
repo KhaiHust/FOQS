@@ -1,20 +1,88 @@
 package project.khaihust.foqs.core.service;
 
+import com.fasterxml.uuid.impl.UUIDUtil;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import project.khaihust.foqs.core.buffer.IPrefetchBufferRegistry;
-import project.khaihust.foqs.core.proto.DequeueRequestDto;
-import project.khaihust.foqs.core.proto.DequeueResponseDto;
-import project.khaihust.foqs.core.proto.DequeueServiceGrpc;
-import project.khaihust.foqs.core.proto.DequeuedMessageDto;
+import project.khaihust.foqs.core.proto.*;
+import project.khaihust.foqs.core.storage.ISingleShardQueueRepository;
 
 import java.time.Duration;
-
+import java.util.HashSet;
+import java.util.UUID;
+@Slf4j
 @RequiredArgsConstructor
 public class DequeueService extends DequeueServiceGrpc.DequeueServiceImplBase {
+    private static final int DEFAULT_MAX_RETRIES = 5;
     private final IPrefetchBufferRegistry prefetchBufferRegistry;
+    private final ISingleShardQueueRepository  singleShardQueueRepository;
+
+    @Override
+    public void batchAck(BatchAckRequestDto request, StreamObserver<BatchAckResponseDto> responseObserver) {
+        try {
+            var incomingUuids = request.getMessageIdsList().stream()
+                    .map(UUID::fromString)
+                    .toList();
+
+            var successfulUuids = singleShardQueueRepository.ackMessages(incomingUuids);
+
+            var successSet = new HashSet<>(successfulUuids);
+            var failedIds = incomingUuids.stream()
+                    .filter(id -> !successSet.contains(id))
+                    .map(UUID::toString)
+                    .toList();
+
+            var ackMessageIds = successfulUuids.stream()
+                    .map(UUID::toString)
+                    .toList();
+            var response = BatchAckResponseDto.newBuilder()
+                    .addAllAckedMessageIds(ackMessageIds)
+                    .addAllFailedMessageIds(failedIds)
+                    .build();
+
+            responseObserver.onNext(response);
+            responseObserver.onCompleted();
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription("One or more message IDs are invalid UUIDs")
+                    .asRuntimeException());
+        } catch (Exception e) {
+            log.error("Batch ACK failed", e);
+            responseObserver.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+        }
+    }
+
+    @Override
+    public void batchNack(BatchNackRequestDto request, StreamObserver<BatchNackResponseDto> responseObserver) {
+        try {
+            var messageIds = request.getMessageIdsList().stream()
+                    .map(UUID::fromString)
+                    .toList();
+
+            var retryDelayMs = request.getRetryDelayMs();
+            var maxRetryCount = request.getMaxRetryCount() <= 0 ? DEFAULT_MAX_RETRIES : request.getMaxRetryCount();
+
+            var updatedCount = singleShardQueueRepository.nackMessages(messageIds, retryDelayMs, maxRetryCount);
+
+            responseObserver.onNext(BatchNackResponseDto.newBuilder()
+                    .setSuccessCount(updatedCount)
+                    .build());
+            responseObserver.onCompleted();
+
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription("One or more message IDs are invalid UUIDs")
+                    .asRuntimeException());
+        } catch (Exception e) {
+            log.error("Failed to process Batch NACK", e);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription(e.getMessage())
+                    .asRuntimeException());
+        }
+    }
 
     @Override
     public void dequeue(DequeueRequestDto request, StreamObserver<DequeueResponseDto> responseObserver) {
