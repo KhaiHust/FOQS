@@ -60,7 +60,7 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
                     FROM queue_messages
                     WHERE topic = ? 
                       AND status = 0 
-                      AND deliver_after <= NOW(3)
+                      AND deliver_after <= ?
                     ORDER BY priority ASC, id ASC
                     LIMIT ?
                     FOR UPDATE SKIP LOCKED
@@ -73,7 +73,8 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
 
             try (var preparedStatement = connection.prepareStatement(selectSql)) {
                 preparedStatement.setString(1, topic);
-                preparedStatement.setInt(2, batchLimit);
+                preparedStatement.setTimestamp(2, Timestamp.from(now));
+                preparedStatement.setInt(3, batchLimit);
                 try (var rs = preparedStatement.executeQuery()) {
                     while (rs.next()) {
                         var idBytes = rs.getBytes("id");
@@ -122,11 +123,12 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
         String sql = """
             UPDATE queue_messages 
             SET status = 0, lease_until = NULL, retry_count = retry_count + 1 
-            WHERE status = 1 AND lease_until < NOW(3)
+            WHERE status = 1 AND lease_until < ?
         """;
 
         try (var conn = dataSource.getConnection();
              var ps = conn.prepareStatement(sql)) {
+            ps.setTimestamp(1, Timestamp.from(Instant.now()));
             return ps.executeUpdate();
         }
     }
