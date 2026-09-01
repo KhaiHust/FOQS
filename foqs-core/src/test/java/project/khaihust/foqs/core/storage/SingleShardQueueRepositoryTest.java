@@ -186,4 +186,94 @@ class SingleShardQueueRepositoryTest {
 
         assertThat(task.getFuture().isDone()).isFalse();
     }
+
+    @Test
+    @DisplayName("Should lease ready messages in ascending priority order and update status to LEASED")
+    void testLeaseMessages_Success() throws Exception {
+        long now = System.currentTimeMillis();
+        EnqueueTask taskP10 = createTask("orders", 10, "p10".getBytes(StandardCharsets.UTF_8), now - 1000);
+        EnqueueTask taskP1 = createTask("orders", 1, "p1".getBytes(StandardCharsets.UTF_8), now - 1000);
+        EnqueueTask taskP5 = createTask("orders", 5, "p5".getBytes(StandardCharsets.UTF_8), now - 1000);
+
+        repository.enqueueBatch(List.of(taskP10, taskP1, taskP5));
+
+        var leased = repository.leaseMessages("orders", 2, java.time.Duration.ofSeconds(30));
+
+        assertThat(leased).hasSize(2);
+        assertThat(leased.get(0).getPriority()).isEqualTo(1);
+        assertThat(leased.get(0).getId()).isEqualTo(taskP1.getMessageId());
+        assertThat(leased.get(1).getPriority()).isEqualTo(5);
+        assertThat(leased.get(1).getId()).isEqualTo(taskP5.getMessageId());
+
+        // Verify status in DB: 2 leased (status=1), 1 remaining ready (status=0)
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            try (ResultSet rs = stmt.executeQuery("SELECT status, COUNT(*) FROM queue_messages GROUP BY status")) {
+                int status0Count = 0;
+                int status1Count = 0;
+                while (rs.next()) {
+                    int status = rs.getInt(1);
+                    int count = rs.getInt(2);
+                    if (status == 0) status0Count = count;
+                    if (status == 1) status1Count = count;
+                }
+                assertThat(status0Count).isEqualTo(1);
+                assertThat(status1Count).isEqualTo(2);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Should not lease messages whose deliver_after is in the future")
+    void testLeaseMessages_SkipFutureDeliverAfter() throws Exception {
+        long futureTime = System.currentTimeMillis() + 60000;
+        EnqueueTask futureTask = createTask("delayed", 1, "future".getBytes(StandardCharsets.UTF_8), futureTime);
+
+        repository.enqueueBatch(List.of(futureTask));
+
+        var leased = repository.leaseMessages("delayed", 5, java.time.Duration.ofSeconds(30));
+        assertThat(leased).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should return empty list when no messages are available to lease")
+    void testLeaseMessages_NoAvailableMessages() throws SQLException {
+        var leased = repository.leaseMessages("empty-topic", 10, java.time.Duration.ofSeconds(30));
+        assertThat(leased).isEmpty();
+    }
+
+    @Test
+    @DisplayName("Should reclaim expired leases, resetting status to READY and incrementing retry count")
+    void testReclaimExpiredLeases() throws Exception {
+        long now = System.currentTimeMillis();
+        EnqueueTask task = createTask("reclaim-topic", 1, "reclaim-data".getBytes(StandardCharsets.UTF_8), now - 5000);
+        repository.enqueueBatch(List.of(task));
+
+        // Lease with 1 second duration
+        var leased = repository.leaseMessages("reclaim-topic", 1, java.time.Duration.ofSeconds(1));
+        assertThat(leased).hasSize(1);
+
+        // Manually update lease_until to past timestamp to simulate expiration
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("UPDATE queue_messages SET lease_until = ? WHERE id = ?")) {
+            ps.setTimestamp(1, new java.sql.Timestamp(now - 1000));
+            ps.setBytes(2, UUIDUtil.asByteArray(task.getMessageId()));
+            ps.executeUpdate();
+        }
+
+        int reclaimedCount = repository.reclaimExpiredLeases();
+        assertThat(reclaimedCount).isEqualTo(1);
+
+        // Verify message is now READY (status=0), lease_until is NULL, retry_count = 1
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT status, lease_until, retry_count FROM queue_messages WHERE id = ?")) {
+            ps.setBytes(1, UUIDUtil.asByteArray(task.getMessageId()));
+            try (ResultSet rs = ps.executeQuery()) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getInt("status")).isEqualTo(0);
+                assertThat(rs.getTimestamp("lease_until")).isNull();
+                assertThat(rs.getInt("retry_count")).isEqualTo(1);
+            }
+        }
+    }
 }

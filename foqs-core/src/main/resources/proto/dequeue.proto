@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package project.khaihust.foqs.core.proto;
+
+option java_multiple_files = true;
+option java_package = "project.khaihust.foqs.core.proto";
+option java_outer_classname = "DequeueProto";
+
+service DequeueService {
+  rpc Dequeue (DequeueRequestDto) returns (DequeueResponseDto);
+}
+
+message DequeueRequestDto {
+  string topic = 1;
+  int32 count = 2;
+  int32 timeout = 3;
+}
+
+message DequeueResponseDto {
+  repeated DequeuedMessageDto messages = 1;
+}
+
+message DequeuedMessageDto {
+  string message_id = 1;
+  string topic = 2;
+  int32 priority = 3;
+  bytes payload = 4;
+  int64 lease_until_epoch_ms = 5;
+  int32 retry_count = 6;
+  int64 created_at_epoch_ms = 7;
+}

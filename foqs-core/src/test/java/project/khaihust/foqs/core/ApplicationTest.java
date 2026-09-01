@@ -25,6 +25,9 @@ class ApplicationTest {
             assertThat(app.getProducerBatch()).isNotNull();
             assertThat(app.getDatasourceManager()).isNotNull();
             assertThat(app.getEnqueueService()).isNotNull();
+            assertThat(app.getDequeueService()).isNotNull();
+            assertThat(app.getPrefetchBufferRegistry()).isNotNull();
+            assertThat(app.getLeaseReclaimer()).isNotNull();
         } finally {
             app.stop();
         }
@@ -52,6 +55,9 @@ class ApplicationTest {
             assertThat(app.getProducerBatch()).isNotNull();
             assertThat(app.getDatasourceManager()).isNotNull();
             assertThat(app.getEnqueueService()).isNotNull();
+            assertThat(app.getDequeueService()).isNotNull();
+            assertThat(app.getPrefetchBufferRegistry()).isNotNull();
+            assertThat(app.getLeaseReclaimer()).isNotNull();
         } finally {
             app.stop();
         }
@@ -80,6 +86,9 @@ class ApplicationTest {
             assertThat(app.getProducerBatch()).isNotNull();
             assertThat(app.getDatasourceManager()).isNotNull();
             assertThat(app.getEnqueueService()).isNotNull();
+            assertThat(app.getDequeueService()).isNotNull();
+            assertThat(app.getPrefetchBufferRegistry()).isNotNull();
+            assertThat(app.getLeaseReclaimer()).isNotNull();
             assertThat(app.getPort()).isEqualTo(8080);
         } finally {
             app.stop();
