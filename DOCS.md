@@ -1,6 +1,6 @@
 # FOQS (Facebook Ordered Queueing Service) — Technical Design, Architecture & API Reference
 
-FOQS (**Facebook Ordered Queueing Service**) is an enterprise-grade, sharded, low-latency priority message queue service built with **Java 17**, **gRPC / Protocol Buffers 3**, **HikariCP**, and **MySQL InnoDB**. 
+FOQS (**Facebook Ordered Queueing Service**) is a sharded, low-latency priority message queue service built with **Java 17**, **gRPC / Protocol Buffers 3**, **HikariCP**, and **MySQL InnoDB**. 
 
 > [!NOTE]
 > **Architectural Inspiration**: This system is inspired by Meta's (Facebook) production architecture published in [FOQS: Scaling a distributed priority queue (Meta Engineering Blog, 2021)](https://engineering.fb.com/2021/02/22/production-engineering/foqs-scaling-a-distributed-priority-queue/). It adopts Meta's core design tenets—including write-buffering with asynchronous database flushes, proactive in-memory priority prefetching, atomic lease-based consumer contracts, fine-grained ACK/NACK semantics with backoff delay, and background lease reclamation.
@@ -249,7 +249,7 @@ flowchart TD
     PBatch -->|"pollBatch"| Heap["PriorityBlockingQueue(Message)<br/>Min-Heap: Priority ASC, ID ASC"]
     Heap -->|"Messages available"| Return["Return DequeueResponseDto"]
     Heap -->|"Heap size < targetCapacity / 2"| Worker["Replenish Worker"]
-    Worker -->|"SELECT ... FOR UPDATE + UPDATE status=1"| MySQL[("MySQL Shard X")]
+    Worker -->|"SELECT ... FOR UPDATE SKIP LOCKED + UPDATE status=1"| MySQL[("MySQL Shard X")]
 ```
 
 #### Key Mechanics:
@@ -294,7 +294,7 @@ for (var repo : shardQueueRepositories.values()) {
 | Operation | SQL Pattern / Logic | Description |
 | :--- | :--- | :--- |
 | **`enqueueBatch`** | `INSERT INTO queue_messages (id, topic, priority, payload, status, deliver_after, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)` | Batched JDBC execution using `PreparedStatement.addBatch()` and `executeBatch()`. |
-| **`leaseMessages`** | `SELECT id, topic, priority, payload, status, deliver_after, lease_until, retry_count, created_at FROM queue_messages WHERE topic = ? AND status = 0 AND deliver_after <= ? ORDER BY priority ASC, id ASC LIMIT ? FOR UPDATE` followed by `UPDATE queue_messages SET status = 1, lease_until = ? WHERE id IN (...)` | Runs in an explicit transaction (`conn.setAutoCommit(false)`) to atomically claim and lock candidate messages. |
+| **`leaseMessages`** | `SELECT id, topic, priority, payload, deliver_after, retry_count, created_at FROM queue_messages WHERE topic = ? AND status = 0 AND deliver_after <= ? ORDER BY priority ASC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED` followed by `UPDATE queue_messages SET status = 1, lease_until = ? WHERE id IN (...)` | Runs in an explicit transaction (`conn.setAutoCommit(false)`) to atomically claim and lock candidate messages. |
 | **`ackMessages`** | `SELECT id FROM queue_messages WHERE status = 1 AND id IN (...) FOR UPDATE` followed by `UPDATE queue_messages SET status = 2, lease_until = NULL WHERE id IN (...)` | Only acknowledges messages currently in `LEASED` status; committed atomically. |
 | **`nackMessages`** | `UPDATE queue_messages SET status = CASE WHEN retry_count + 1 >= ? THEN 3 ELSE 0 END, lease_until = NULL, deliver_after = ?, retry_count = retry_count + 1 WHERE status = 1 AND id IN (...)` | Conditionally transitions to `DEAD_LETTER (3)` or `READY (0)` with future `deliver_after` backoff. |
 | **`reclaimExpiredLeases`** | `UPDATE queue_messages SET status = 0, lease_until = NULL, retry_count = retry_count + 1 WHERE status = 1 AND lease_until < ? LIMIT 1000` | Resets abandoned leases back to `READY` status with a `LIMIT 1000` batch cap to prevent locking tables during high backlog. |
@@ -373,8 +373,8 @@ CREATE TABLE IF NOT EXISTS queue_messages (
     retry_count INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
-    INDEX idx_fetch_priority (topic, status, deliver_after, priority ASC, id ASC),
-    INDEX idx_reclaim (status, lease_until)
+    INDEX idx_fetch_priority (topic, status, priority ASC, id ASC, deliver_after),
+    INDEX idx_reclaim (lease_until, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ```
 
@@ -382,30 +382,38 @@ CREATE TABLE IF NOT EXISTS queue_messages (
 
 ### 5.2 Index Design & Query Optimization Analysis
 
-#### 1. Composite Index: `idx_fetch_priority (topic, status, deliver_after, priority ASC, id ASC)`
-- **Purpose**: Powers the prefetch query on each shard:
+#### 1. Composite Index: `idx_fetch_priority (topic, status, priority ASC, id ASC, deliver_after)`
+- **Target Query**:
   ```sql
-  SELECT id, topic, priority, payload, status, deliver_after, lease_until, retry_count, created_at 
+  SELECT id, topic, priority, payload, deliver_after, retry_count, created_at 
   FROM queue_messages 
   WHERE topic = ? AND status = 0 AND deliver_after <= ? 
   ORDER BY priority ASC, id ASC 
-  LIMIT ? FOR UPDATE;
+  LIMIT ? FOR UPDATE SKIP LOCKED;
   ```
-- **How It Works**:
-  1. `topic` and `status` act as equality filters ($O(\log N)$ tree dive).
-  2. `deliver_after` evaluates the range condition (`<= NOW()`).
-  3. `priority ASC, id ASC` provides a deterministic sorted order directly from the BTREE without requiring an in-memory or on-disk `Using filesort`.
+- **Why Column Order Matters for the Range Predicate**:
+  1. `topic = ? AND status = 0` are **equality predicates**. The B-Tree dives in $O(\log N)$ directly to the specific `(topic, status)` partition.
+  2. `priority ASC, id ASC` match the `ORDER BY` clause **immediately following the equality columns**. Within the `(topic, status)` partition, all index entries are stored in strictly sorted priority order.
+  3. `deliver_after <= ?` is a **range predicate** (an inequality). In B-Tree indexes, **any range condition terminates index-based ordering for all subsequent columns**.
+     - If the index were defined as `(topic, status, deliver_after, priority, id)`, the entries would be ordered by `deliver_after` timestamp. Because different messages ready for delivery have different timestamps, rows would NOT be sorted by priority. MySQL would be forced to scan all ready rows matching `deliver_after <= NOW()` (potentially millions under backlog) and invoke an on-disk `Using filesort`.
+     - By placing `priority ASC, id ASC` **before** the range predicate `deliver_after`, the physical index order satisfies the `ORDER BY priority ASC, id ASC` clause directly.
+  4. **Index Condition Pushdown (ICP)**: MySQL traverses the index in priority order and pushes the `deliver_after <= ?` check down into InnoDB (`Extra: Using index condition`). As soon as MySQL finds `LIMIT` matching rows, it stops scanning immediately. Zero sorting is performed (`Using filesort` is eliminated).
 
-#### 2. Composite Index: `idx_reclaim (status, lease_until)`
-- **Purpose**: Powers the background recovery query on each shard:
+- **Why `FOR UPDATE SKIP LOCKED`**:
+  - `FOR UPDATE` acquires exclusive row-level X-locks on matching candidate rows to prevent concurrent leases.
+  - `SKIP LOCKED` ensures that if another concurrent prefetcher thread or consumer instance holds locks on rows in the topic, InnoDB immediately skips past the locked rows and locks the next available ready messages. This eliminates lock wait timeouts, deadlocks, and worker serialization.
+
+#### 2. Composite Index: `idx_reclaim (lease_until, status)`
+- **Target Query**:
   ```sql
   UPDATE queue_messages 
   SET status = 0, lease_until = NULL, retry_count = retry_count + 1 
   WHERE status = 1 AND lease_until < ?
   LIMIT 1000;
   ```
-- **How It Works**:
-  Filters immediately to active leases (`status = 1`) and scans only expired timestamps, avoiding full table scans.
+- **Why `lease_until` Leads**:
+  - Leading with `lease_until` allows the index to scan only from the oldest timestamp up to `NOW()`, quickly finding expired leases.
+  - Furthermore, leading with `lease_until` ensures this index does not share a `(status, ...)` prefix with `idx_fetch_priority`, preventing the MySQL cost optimizer from selecting the wrong index under heavy backlog.
 
 ---
 
@@ -494,7 +502,7 @@ sequenceDiagram
     Reg-->>DS: PrefetchBatch instance
     
     Note over Worker: Background loop (50ms interval or low-watermark)
-    Worker->>DB: SELECT ... WHERE topic=? AND status=0 FOR UPDATE
+    Worker->>DB: SELECT ... WHERE topic=? AND status=0 FOR UPDATE SKIP LOCKED
     Worker->>DB: UPDATE ... SET status=1, lease_until=NOW+30s
     DB-->>Worker: Leased Message Records
     Worker->>Heap: minHeap.addAll(messages)
@@ -544,7 +552,7 @@ sequenceDiagram
         DS->>S2: ackMessages(idC)
         S2-->>DS: acked = none
         
-        DS-->>Consumer: BatchAckResponseDto(acked: idA, idB; failed: idC)
+        DS-->>Consumer: BatchAckResponseDto(acked: idA, idB, failed: idC)
     end
 ```
 
@@ -561,15 +569,15 @@ sequenceDiagram
     participant S1 as Repo Shard 1
     participant S2 as Repo Shard 2
 
-    Consumer->>DS: BatchNackRequestDto(UUIDs: idA, idB; retry_delay=5s, max_retries=3)
+    Consumer->>DS: BatchNackRequestDto(UUIDs: idA, idB, retry_delay=5s, max_retries=3)
     
-    DS->>S0: nackMessages(idA, idB; 5000ms, 3)
+    DS->>S0: nackMessages(idA, idB, 5000ms, 3)
     S0-->>DS: updatedCount = 1 (idA on Shard 0)
     
-    DS->>S1: nackMessages(idA, idB; 5000ms, 3)
+    DS->>S1: nackMessages(idA, idB, 5000ms, 3)
     S1-->>DS: updatedCount = 1 (idB on Shard 1)
     
-    DS->>S2: nackMessages(idA, idB; 5000ms, 3)
+    DS->>S2: nackMessages(idA, idB, 5000ms, 3)
     S2-->>DS: updatedCount = 0
     
     Note over DS: totalSuccess = 1 + 1 + 0 = 2
@@ -1042,7 +1050,7 @@ To measure real-world performance under controlled saturation, the `foqs-bench` 
 
 ### 10.2 Experiment 1: Baseline Knee Characterization
 
-- **Environment**: Single MySQL 8.0 Shard, 4GB InnoDB Buffer Pool, MacBook M4 (Docker VM, named volume, `--skip-log-bin`, 4 CPUs, 8GB RAM).
+- **Environment**: Single MySQL 8.0 Shard, 4GB InnoDB Buffer Pool, Apple MacBook (Apple M4, 10 CPU cores [4P + 6E], 24GB Unified LPDDR5X Memory, Docker Desktop VM 10 vCPU, named volumes, `--skip-log-bin`).
 - **Server JVM**: `-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=20`.
 
 | Target Rate (msg/s) | Achieved Rate (msg/s) | p50 Latency | p95 Latency | **p99 Latency** | p99.9 Latency | Observations |
@@ -1118,11 +1126,12 @@ Prior to scaling evaluation, message distribution uniformity was gated across 60
 - **MurmurHash3 (Resolved)**: Passed the gate with **5.00% skew** (`[26250, 24999, 23750]`), where Shard 0 received 35.00%, Shard 1 received 33.33%, and Shard 2 received 31.67%.
 
 #### 2. Experimental Environment & Resource Parity
-- **Hardware**: MacBook M4 (16GB Docker Desktop VM).
+- **Host Machine**: Apple MacBook (Apple M4, 10 CPU cores [4 Performance + 6 Efficiency], 24 GB Unified LPDDR5X RAM, ~50GB SSD volume).
+- **Virtualization**: Docker Desktop on macOS (Apple Virtualization Framework, 10 vCPUs, 12–16GB Docker VM RAM).
 - **Per-Shard Resources (Strict Parity)**:
   - MySQL 8.0: `--cpus=2 --memory=3g`, InnoDB Buffer Pool **2GB** (`2147483648` bytes).
-  - Storage & Logging: Named Docker volumes (`foqs-shard-N-data`), `--skip-log-bin`, `--innodb-flush-log-at-trx-commit=2`.
-- **FOQS Server JVM**: `-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=20`.
+  - Storage & Logging: Named Docker volumes (`foqs-shard-N-data`, bypassing virtiofs filesystem overhead), `--skip-log-bin`, `--innodb-flush-log-at-trx-commit=2`, `--innodb-io-capacity=2000`.
+- **FOQS Server JVM**: OpenJDK 17 (`-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=20`).
 - **Load Generator**: Open-loop generator with 2GB heap, `maxInflight=2048`, `payload=256B`, round-robin across 60 topics (`--topics=60`).
 - **Execution Protocol**: `REPEATS=2`, `WARMUP=20s`, `DURATION=60s`. Clean `TRUNCATE queue_messages` across all active shards prior to each run.
 

@@ -1,6 +1,6 @@
 # FOQS (Facebook Ordered Queueing Service)
 
-FOQS is an enterprise-grade, sharded priority message queue service built with Java 17, gRPC/Protobuf, and MySQL InnoDB.
+FOQS is a sharded priority message queue service built with Java 17, gRPC/Protobuf, and MySQL InnoDB.
 
 > Inspired by Meta's production architecture: [**FOQS: Scaling a distributed priority queue** (Meta Engineering Blog)](https://engineering.fb.com/2021/02/22/production-engineering/foqs-scaling-a-distributed-priority-queue/).
 
@@ -19,70 +19,58 @@ FOQS is an enterprise-grade, sharded priority message queue service built with J
 ```mermaid
 flowchart TD
     subgraph Clients ["Client Applications"]
-        P["Producers (Writers)"]
-        C["Consumers (Readers)"]
+        P["Producers"]
+        C["Consumers"]
     end
 
-    subgraph FOQS ["FOQS Service (gRPC Layer)"]
-        SR["ShardRouter (MurmurHash3 Consistent Hash Ring)"]
-
-        subgraph Ingestion ["Write Path (Ingestion)"]
-            WB0["Write Buffer (Shard 0)"]
-            WB1["Write Buffer (Shard 1)"]
-            WB2["Write Buffer (Shard 2)"]
-        end
-
-        subgraph Consumption ["Read Path (Consumption)"]
-            MH0["Priority Min-Heap (Topic A)"]
-            MH1["Priority Min-Heap (Topic B)"]
-            LR["LeaseReclaimer Daemon"]
-        end
+    subgraph FOQS ["FOQS Core Service (gRPC)"]
+        Router["ShardRouter<br/>(Consistent Hash Ring by Topic)"]
+        Buffers["In-Memory Buffering Tier<br/>• Async Write Micro-batches<br/>• Priority Min-Heap Prefetch"]
+        Reclaimer["LeaseReclaimer Daemon"]
     end
 
-    subgraph Shards ["Storage Shards (MySQL 8.0 InnoDB)"]
-        DB0[("Shard 0 (Port 3306)")]
-        DB1[("Shard 1 (Port 3307)")]
-        DB2[("Shard 2 (Port 3308)")]
+    subgraph Storage ["MySQL 8.0 Storage Shards"]
+        S0[("Shard 0 (:3306)")]
+        S1[("Shard 1 (:3307)")]
+        S2[("Shard 2 (:3308)")]
     end
 
-    %% Enqueue Flow
-    P -->|"1. Enqueue(topic, priority, payload)"| SR
-    SR -->|"Route topic A"| WB0
-    SR -->|"Route topic B"| WB1
-    SR -->|"Route topic C"| WB2
-    WB0 -->|"Micro-Batch INSERT"| DB0
-    WB1 -->|"Micro-Batch INSERT"| DB1
-    WB2 -->|"Micro-Batch INSERT"| DB2
+    P -->|"1. Enqueue (by topic)"| Router
+    Router --> Buffers
+    Buffers -->|"Micro-Batch INSERT"| Storage
 
-    %% Dequeue Flow
-    DB0 -.->|"Proactive Lease Batch"| MH0
-    DB1 -.->|"Proactive Lease Batch"| MH1
-    C -->|"2. Dequeue(topic A)"| MH0
-    C -->|"2. Dequeue(topic B)"| MH1
-    C -->|"3. Scatter-gather BatchAck / BatchNack"| DB0
-    C -->|"3. Scatter-gather BatchAck / BatchNack"| DB1
-    C -->|"3. Scatter-gather BatchAck / BatchNack"| DB2
-    LR -.->|"Periodic Sweep"| DB0
-    LR -.->|"Periodic Sweep"| DB1
-    LR -.->|"Periodic Sweep"| DB2
+    Storage -.->|"Background Lease"| Buffers
+    C -->|"2. Dequeue (O(1) from RAM)"| Buffers
+    C -->|"3. Scatter-Gather ACK / NACK"| Storage
+    Reclaimer -.->|"Auto-Reclaim Expired Leases"| Storage
 ```
 
 ### How It Works
 
-1. **Write Path (Enqueue)**:
-   - Producers submit messages with `(topic, priority, payload, deliver_after)` via gRPC.
-   - [`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java) hashes the topic to determine its target database shard.
-   - Messages are queued in that shard's in-memory write buffer and flushed in transactional micro-batches (`INSERT INTO queue_messages`), avoiding per-message round-trips.
-2. **Read Path (Dequeue)**:
-   - For each active topic, a background replenisher proactively leases a batch of messages from MySQL into an in-memory priority min-heap.
-   - Consumers call `Dequeue` and are served directly from RAM in $O(1)$ time with strict priority ordering (`priority ASC, id ASC`).
-3. **Acknowledgment & Recovery**:
-   - Consumers send `BatchAck` or `BatchNack` containing message UUIDs across shards; FOQS scatters the updates to each shard repository in parallel.
-   - If a consumer crashes before acknowledging, [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) automatically sweeps expired leases across all shards and makes them available for redelivery.
+- **Write Path (Enqueue)**: Producers send messages $\to$ [`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java) hashes topic to a target shard $\to$ In-memory ring buffer flushes transactional micro-batches into MySQL.
+- **Read Path (Dequeue)**: Background workers proactively lease batches from MySQL into topic-level priority min-heaps in RAM $\to$ Consumers dequeue in $O(1)$ directly from memory.
+- **Scatter-Gather ACK & Fault Recovery**: Multi-message acknowledgments are partitioned by shard and executed in parallel; background [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) recovers abandoned leases with per-shard failure isolation.
+
+---
 
 ## Performance & Benchmarking (`foqs-bench`)
 
 FOQS includes an open-loop load testing module (`foqs-bench`) designed to avoid coordinated omission by scheduling sends at intended timestamps and capturing high-resolution latency percentiles with **HdrHistogram**.
+
+### Benchmark Hardware & Environment Specs
+
+| Component | Specification |
+| :--- | :--- |
+| **Host System** | Apple MacBook (Apple Silicon M4) |
+| **CPU** | **Apple M4** — 10 Cores (4 Performance cores + 6 Efficiency cores) |
+| **RAM** | **24 GB Unified Memory** (LPDDR5X, 120 GB/s bandwidth) |
+| **Storage** | Apple NVMe PCIe SSD (~50 GB volume allocated) |
+| **OS / Virtualization** | macOS (Darwin arm64) / Docker Desktop (Apple Virtualization Framework, 10 vCPUs, 12–16 GB VM RAM) |
+| **Database Shards** | 3× MySQL 8.0 containers (`--cpus=2 --memory=3g`, 2GB buffer pool per shard, named volumes, `--skip-log-bin`) |
+| **Server JVM** | OpenJDK 17 (`-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=20`) |
+| **Generator** | `foqs-bench` Open-Loop Scheduler with HdrHistogram (`-Xms2g -Xmx2g`, `maxInflight=2048`, `payload=256B`) |
+
+---
 
 ### Empirical Results
 
