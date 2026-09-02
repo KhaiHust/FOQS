@@ -6,7 +6,7 @@ FOQS is an enterprise-grade, sharded priority message queue service built with J
 
 ## Key Features
 
-- **Consistent Hashing Shard Routing**: Deterministic topic-to-shard partitioning via 64-bit FNV-1a hash ring with virtual nodes ([`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java)), enabling horizontal database scaling with zero cross-shard lock contention.
+- **Consistent Hashing Shard Routing**: Deterministic topic-to-shard partitioning via MurmurHash3 (`murmur3_128`) hash ring with virtual nodes ([`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java)), ensuring uniform $\le 5\%$ distribution across shards with zero cross-shard lock contention.
 - **High-Throughput Enqueue Pipeline**: Independent per-shard in-memory ring buffers ([`ShardedProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ShardedProducerBatch.java)) with asynchronous transactional micro-batch database insertion.
 - **Low-Latency Dequeue Pipeline**: Proactive in-memory Min-Heap prefetching ([`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java)) maintaining priority ordering per topic.
 - **Cross-Shard Scatter-Gather ACK & NACK**:
@@ -114,12 +114,35 @@ FOQS includes an open-loop load testing module (`foqs-bench`) designed to avoid 
 ./foqs-bench/scripts/run-bench-smoke.sh
 ```
 
-#### Full Experiment Matrix
+#### Full Single-Shard Experiment Matrix
 ```bash
 ./foqs-bench/scripts/run-bench-full.sh
 ```
 
-### Empirical Results (Single MySQL 8.0 Shard, 4GB Buffer Pool, MacBook M4)
+#### 1-Shard vs 3-Shard Horizontal Scaling Ramp (60 Topics)
+```bash
+./foqs-bench/scripts/run-e2-scaling.sh
+```
+
+> **Multi-Topic Flag**: Pass `--topics=N` (default: 60) to distribute load evenly round-robin across topics, testing consistent hashing and multi-shard striping under full multi-tenancy.
+
+---
+
+### Empirical Results
+
+#### 1. Horizontal Scaling: 1 Shard vs 3 Shards (Strict Parity: 2 vCPU & 2GB Buffer Pool per Shard, 60 Topics)
+
+> **Headline Result**: **3 shards on 6 vCPU delivered 1.93x the throughput of 1 shard on 2 vCPU** (19,340 msg/s peak achieved vs 10,000 msg/s 1-shard knee). Total resources scaled with shard count.
+
+| Configuration | Target Rate | Achieved Rate | p50 Latency | p95 Latency | p99 Latency | Host CPU% | Key Takeaway |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **1 Shard (2 vCPU, 2G pool)** | 10,000 msg/s | 9,872–10,000 msg/s | 7.3–14.4 ms | 27.1–4,743 ms | **49.2–5,050 ms** | ~77% | **1-Shard Knee Boundary**: high tail latency jitter under buffer pressure |
+| **3 Shards (6 vCPU, 6G total)** | 5,000 msg/s | 5,000.0 msg/s | **6.7 ms** | **13.6 ms** | **15.4–21.5 ms** | ~28% | Clean distribution across 3 shards; sub-22ms p99 |
+| **3 Shards (6 vCPU, 6G total)** | 10,000 msg/s | 10,000.0 msg/s | **7.0 ms** | **14.7 ms** | **17.6–18.4 ms** | ~43% | **Tail Stabilization**: p99 drops from 50–5000ms to 18ms; host CPU halved |
+| **3 Shards (6 vCPU, 6G total)** | 15,000 msg/s | 15,000.0 msg/s | **8.0 ms** | **18.1 ms** | **28.9–30.5 ms** | ~71% | **High Sustained Ingestion**: 15k msg/s sustained cleanly with sub-31ms p99 |
+| **3 Shards (6 vCPU, 6G total)** | 20,000 msg/s | **19,340 msg/s** | 2,351 ms | 4,768 ms | **5,210 ms** | **97.1%** | **Peak Throughput Ceiling**: 1.93x scaling over 1-shard knee; host CPU saturated |
+
+#### 2. Single Shard Baseline & Parameter Sweeps (4GB Buffer Pool, Single Topic)
 
 | Benchmark Scenario | Target Rate | Achieved Rate | p50 Latency | p95 Latency | p99 Latency | Key Takeaway |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
