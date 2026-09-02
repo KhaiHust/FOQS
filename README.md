@@ -14,6 +14,65 @@ FOQS is an enterprise-grade, sharded priority message queue service built with J
   - `BatchNack`: Exponential/fixed retry backoff with automatic Dead-Letter Queue (`status = 3`) routing across shards.
 - **Automated Fault-Isolated Lease Reclamation**: Background multi-shard `LeaseReclaimer` monitoring expired leases and returning them to `READY` status with per-shard failure isolation.
 
+## Architecture Design
+
+```mermaid
+flowchart TD
+    subgraph Clients ["Client Applications"]
+        P["Producers (Writers)"]
+        C["Consumers (Readers)"]
+    end
+
+    subgraph FOQS ["FOQS Service (gRPC Layer)"]
+        SR["ShardRouter<br/><i>Consistent Hash Ring (MurmurHash3)</i>"]
+
+        subgraph Ingestion ["Write Path (Ingestion)"]
+            WB0["Write Buffer 0"]
+            WB1["Write Buffer 1"]
+            WB2["Write Buffer 2"]
+        end
+
+        subgraph Consumption ["Read Path (Consumption)"]
+            MH0["Priority Min-Heap (Topic A)"]
+            MH1["Priority Min-Heap (Topic B)"]
+            LR["LeaseReclaimer Daemon"]
+        end
+    end
+
+    subgraph Shards ["Storage Shards (MySQL 8.0 InnoDB)"]
+        DB0[("Shard 0 (:3306)")]
+        DB1[("Shard 1 (:3307)")]
+        DB2[("Shard 2 (:3308)")]
+    end
+
+    %% Enqueue Flow
+    P -->|"1. Enqueue(topic, priority, payload)"| SR
+    SR -->|"Route by topic"| WB0 & WB1 & WB2
+    WB0 -->|"Micro-Batch INSERT"| DB0
+    WB1 -->|"Micro-Batch INSERT"| DB1
+    WB2 -->|"Micro-Batch INSERT"| DB2
+
+    %% Dequeue Flow
+    DB0 -.->|"Proactive Lease Batch"| MH0
+    DB1 -.->|"Proactive Lease Batch"| MH1
+    C -->|"2. Dequeue(topic)"| MH0 & MH1
+    C -->|"3. BatchAck / BatchNack"| DB0 & DB1 & DB2
+    LR -.->|"Background Lease Sweep"| DB0 & DB1 & DB2
+```
+
+### How It Works
+
+1. **Write Path (Enqueue)**:
+   - Producers submit messages with `(topic, priority, payload, deliver_after)` via gRPC.
+   - [`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java) hashes the topic to determine its target database shard.
+   - Messages are queued in that shard's in-memory write buffer and flushed in transactional micro-batches (`INSERT INTO queue_messages`), avoiding per-message round-trips.
+2. **Read Path (Dequeue)**:
+   - For each active topic, a background replenisher proactively leases a batch of messages from MySQL into an in-memory priority min-heap.
+   - Consumers call `Dequeue` and are served directly from RAM in $O(1)$ time with strict priority ordering (`priority ASC, id ASC`).
+3. **Acknowledgment & Recovery**:
+   - Consumers send `BatchAck` or `BatchNack` containing message UUIDs across shards; FOQS scatters the updates to each shard repository in parallel.
+   - If a consumer crashes before acknowledging, [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) automatically sweeps expired leases across all shards and makes them available for redelivery.
+
 ## Quick Start & How to Run
 
 ### Prerequisites
