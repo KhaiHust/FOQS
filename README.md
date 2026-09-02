@@ -122,13 +122,14 @@ FOQS includes an open-loop load testing module (`foqs-bench`) designed to avoid 
 
 | Benchmark Scenario | Target Rate | Achieved Rate | p50 Latency | p95 Latency | p99 Latency | Key Takeaway |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Baseline (Linear Regime)** | 1,000 msg/s | 999.99 msg/s | **7.4 ms** | **14.4 ms** | **29.1 ms** | Predictable sub-30ms p99 latency |
-| **Baseline (Sustained Sweet Spot)** | 6,000 msg/s | 5,999.97 msg/s | **9.5 ms** | **58.2 ms** | **102.2 ms** | Clean throughput with bounded sub-105ms p99 |
-| **Baseline (Latency Knee)** | 7,000 msg/s | 6,999.97 msg/s | **12.0 ms** | **168.1 ms** | **571.9 ms** | Latency knee inflection point (p99 > 500ms) |
-| **Baseline (Throughput Ceiling)** | 8,000 msg/s | 7,999.98 msg/s | **13.7 ms** | **184.2 ms** | **239.1 ms** | Max single-shard capacity (~8k sustained; 10.6k dequeue) |
-| **Baseline (Saturation Cliff)**| 10,000 msg/s | 8,980.44 msg/s | 9.2 s | 33.9 s | 38.7 s | Saturation cliff; queuing runaway ($p99 > 38\text{s}$) |
-| **Optimal Batching** (`bt=100, fi=1ms`) | 4,800 msg/s | 4,799.97 msg/s | **1.2 ms** | **28.9 ms** | **48.6 ms** | >60% p99 reduction vs small batches (`bt=10`) |
-| **Lease Recovery** | 5,000 msg/s | — | — | — | **~225 ms** | Consumer SIGKILL redelivery with zero message loss |
+| **Baseline (Linear Regime)** | 1,000 msg/s | 999.98 msg/s | **7.4 ms** | **14.3 ms** | **24.6 ms** | Sub-25ms p99 latency with zero queue buildup |
+| **Baseline (High Efficiency)** | 5,000 msg/s | 4,999.98 msg/s | **6.4 ms** | **16.5 ms** | **33.4 ms** | Micro-batching keeps tail latency tightly bounded |
+| **Baseline (Sweet Spot)** | 6,000 msg/s | 5,999.97 msg/s | **7.3 ms** | **25.9 ms** | **94.9 ms** | Sub-100ms p99 with 8ms p50 |
+| **Baseline (High Load)** | 8,000 msg/s | 7,999.98 msg/s | **8.1 ms** | **37.1 ms** | **80.7 ms** | High ingestion throughput sustained cleanly |
+| **Baseline (Max Single Shard)** | 10,000 msg/s | 9,999.98 msg/s | **8.6 ms** | **79.0 ms** | **167.6 ms** | 10k msg/s sustained with 13.3k msg/s dequeue capacity |
+| **Optimal Batching** (`bt=50, fi=5ms`) | 4,800 msg/s | 4,799.97 msg/s | **3.2 ms** | **12.3 ms** | **25.3 ms** | Lowest p99 in grid (25.3ms) with zero filesort |
+| **Backlog (560k depth, 512M pool)** | 4,800 msg/s | 4,799.99 msg/s | **7.3 ms** | **16.8 ms** | **23.6 ms** | Filesort completely eliminated via optimized index |
+| **Lease Recovery (150k messages)** | 5,000 msg/s | — | — | — | **~30.0 s** | 100% of 150k un-acked messages reclaimed upon expiry |
 
 ---
 

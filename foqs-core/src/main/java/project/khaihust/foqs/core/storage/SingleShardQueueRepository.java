@@ -140,7 +140,8 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
             return Collections.emptyList();
         }
 
-        String placeholders = String.join(",", Collections.nCopies(messageIds.size(), "?"));
+        var sortedIds = messageIds.stream().distinct().sorted().toList();
+        String placeholders = String.join(",", Collections.nCopies(sortedIds.size(), "?"));
         String selectSql = "SELECT id FROM queue_messages WHERE status = 1 AND id IN (" + placeholders + ") FOR UPDATE";
 
         List<UUID> acked = new ArrayList<>();
@@ -148,8 +149,8 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
             conn.setAutoCommit(false);
 
             try (var psSelect = conn.prepareStatement(selectSql)) {
-                for (int i = 0; i < messageIds.size(); i++) {
-                    psSelect.setBytes(i + 1, UUIDUtil.asByteArray(messageIds.get(i)));
+                for (int i = 0; i < sortedIds.size(); i++) {
+                    psSelect.setBytes(i + 1, UUIDUtil.asByteArray(sortedIds.get(i)));
                 }
                 try (var rs = psSelect.executeQuery()) {
                     while (rs.next()) {
@@ -159,6 +160,7 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
             }
 
             if (!acked.isEmpty()) {
+                acked.sort(null);
                 String updatePlaceholders = String.join(",", Collections.nCopies(acked.size(), "?"));
                 String updateSql = "UPDATE queue_messages SET status = 2, lease_until = NULL WHERE id IN (" + updatePlaceholders + ")";
                 try (var psUpdate = conn.prepareStatement(updateSql)) {
@@ -180,8 +182,9 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
             return 0;
         }
 
+        var sortedIds = messageIds.stream().distinct().sorted().toList();
         var nextDelivery = Instant.now().plusMillis(Math.max(0, retryDelayMs));
-        var placeholders = String.join(",", Collections.nCopies(messageIds.size(), "?"));
+        var placeholders = String.join(",", Collections.nCopies(sortedIds.size(), "?"));
 
         var sql = """
             UPDATE queue_messages
@@ -201,8 +204,8 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
             ps.setInt(1, maxRetries);
             ps.setTimestamp(2, Timestamp.from(nextDelivery));
 
-            for (int i = 0; i < messageIds.size(); i++) {
-                ps.setBytes(i + 3, UUIDUtil.asByteArray(messageIds.get(i)));
+            for (int i = 0; i < sortedIds.size(); i++) {
+                ps.setBytes(i + 3, UUIDUtil.asByteArray(sortedIds.get(i)));
             }
 
             return ps.executeUpdate();

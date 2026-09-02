@@ -896,12 +896,12 @@ To measure real-world performance under controlled saturation, the `foqs-bench` 
 
 | Target Rate (msg/s) | Achieved Rate (msg/s) | p50 Latency | p95 Latency | **p99 Latency** | p99.9 Latency | Observations |
 | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **1,000** | 999.99 | 7.44 ms | 14.43 ms | **29.06 ms** | 54.98 ms | **Linear Regime**: sub-30ms p99 latency; minimal queue contention |
-| **5,000** | 4,999.99 | 8.59 ms | 62.78 ms | **118.72 ms** | 233.34 ms | **Moderate Load**: throughput sustained; tail latency starts to elevate |
-| **6,000** | 5,999.97 | 9.45 ms | 58.24 ms | **102.21 ms** | 181.50 ms | **Sustained Sweet Spot**: p50 < 10ms, p99 tightly bounded at ~102ms |
-| **7,000** | 6,999.97 | 11.99 ms | 168.06 ms | **571.90 ms** | 1,038.34 ms | **Latency Knee**: throughput sustained, but tail queuing pushes p99 > 500ms |
-| **8,000** | 7,999.98 | 13.72 ms | 184.19 ms | **239.10 ms** | 533.50 ms | **Throughput Ceiling**: ~8,000 msg/s sustained with 10.6k msg/s dequeue capacity |
-| **10,000** | 8,980.44 | 9.17 s | 33.88 s | **38.70 s** | 39.58 s | **Saturation Cliff / Collapse**: unable to sustain rate; queuing runaway |
+| **1,000** | 999.98 | 7.38 ms | 14.34 ms | **24.56 ms** | 44.03 ms | **Linear Regime**: sub-25ms p99; zero queue buildup |
+| **5,000** | 4,999.98 | 6.37 ms | 16.45 ms | **33.41 ms** | 78.10 ms | **High Efficiency**: write batching keeps p99 under 35ms |
+| **6,000** | 5,999.97 | 7.33 ms | 25.92 ms | **94.91 ms** | 158.18 ms | **Sustained Sweet Spot**: p50 < 8ms, p99 tightly bounded at <95ms |
+| **7,000** | 6,999.96 | 7.50 ms | 34.66 ms | **109.33 ms** | 264.93 ms | **High Load**: stable throughput, sub-110ms p99 |
+| **8,000** | 7,999.98 | 8.06 ms | 37.10 ms | **80.74 ms** | 170.56 ms | **Robust Ingestion**: 8,000 msg/s sustained cleanly |
+| **10,000** | 9,999.98 | 8.60 ms | 78.98 ms | **167.55 ms** | 225.98 ms | **Full Saturation Bound**: 10k msg/s sustained with 13.3k dequeue capacity |
 
 ---
 
@@ -911,56 +911,55 @@ Evaluated $4 \times 4$ combinations of `batchThreshold` $\in \{10, 50, 100, 500\
 
 | `batchThreshold` | `flushIntervalMs` | p50 Latency | p95 Latency | **p99 Latency** | Analysis |
 | :---: | :---: | :---: | :---: | :---: | :--- |
-| **10** | 1 ms | 1.32 ms | 102.40 ms | **141.47 ms** | Excessive JDBC transactions increase lock contention |
-| **10** | 5 ms | 1.52 ms | 73.66 ms | **97.47 ms** | Linger flush helps accumulate larger batches |
-| **10** | 10 ms | 1.56 ms | 77.79 ms | **100.16 ms** | Comparable to 5ms linger |
-| **10** | 50 ms | 1.64 ms | 82.02 ms | **113.57 ms** | Higher tail latency due to batch accumulation lag |
-| **50** | 1 ms | 1.29 ms | 33.82 ms | **51.81 ms** | **Fastest p99** (>60% reduction vs `bt=10`) |
-| **50** | 5 ms | 4.09 ms | 33.73 ms | **75.18 ms** | Consistent performance |
-| **50** | 10 ms | 7.21 ms | 39.62 ms | **65.97 ms** | Default production-like balance |
-| **50** | 50 ms | 6.23 ms | 33.10 ms | **49.86 ms** | Low overhead at steady state |
-| **100** | 1 ms | 1.23 ms | 28.94 ms | **48.58 ms** | **Optimal p50/p99 sweet spot** |
-| **100** | 5 ms | 3.91 ms | 28.88 ms | **49.50 ms** | Highly balanced latency profile |
-| **100** | 10 ms | 7.31 ms | 28.58 ms | **54.38 ms** | Standard default configuration |
-| **100** | 50 ms | 12.41 ms | 41.20 ms | **82.34 ms** | Higher p50 due to 50ms flush timeout |
-| **500** | 1 ms | 1.22 ms | 29.45 ms | **51.01 ms** | Maximum write batch efficiency |
-| **500** | 5 ms | 3.97 ms | 29.46 ms | **54.46 ms** | Stable under high ingestion rates |
-| **500** | 10 ms | 7.71 ms | 37.26 ms | **69.21 ms** | Moderate tail jitter |
-| **500** | 50 ms | 34.56 ms | 67.94 ms | **91.20 ms** | High p50 latency caused by 50ms linger timer |
+| **10** | 1 ms | 1.26 ms | 67.02 ms | **146.42 ms** | Excessive tiny JDBC transactions increase lock overhead |
+| **10** | 5 ms | 1.40 ms | 29.95 ms | **52.08 ms** | Linger flush helps batch small payloads |
+| **10** | 10 ms | 1.50 ms | 40.96 ms | **63.47 ms** | Moderate tail latency |
+| **10** | 50 ms | 1.44 ms | 31.34 ms | **55.44 ms** | Acceptable latency at 4.8k msg/s |
+| **50** | 1 ms | 1.10 ms | 13.75 ms | **33.48 ms** | **Ultra-low latency**: sub-35ms p99 with 1.1ms p50 |
+| **50** | 5 ms | 3.20 ms | 12.30 ms | **25.34 ms** | **Lowest p99 in grid**: 25.3ms |
+| **50** | 10 ms | 6.10 ms | 15.63 ms | **26.77 ms** | Extremely consistent tail latency |
+| **50** | 50 ms | 5.40 ms | 15.12 ms | **43.46 ms** | Solid throughput balance |
+| **100** | 1 ms | 1.22 ms | 20.93 ms | **52.45 ms** | Excellent p50 with sub-55ms p99 |
+| **100** | 5 ms | 3.61 ms | 19.90 ms | **76.10 ms** | Standard balanced configuration |
+| **100** | 10 ms | 6.59 ms | 15.89 ms | **68.28 ms** | Default production configuration |
+| **100** | 50 ms | 10.05 ms | 23.62 ms | **40.46 ms** | Low overhead at steady state |
+| **500** | 1 ms | 1.20 ms | 23.24 ms | **25.81 ms** | **Fastest write throughput**: p99 = 25.8ms |
+| **500** | 5 ms | 3.62 ms | 17.93 ms | **50.96 ms** | Stable under high ingestion bursts |
+| **500** | 10 ms | 7.16 ms | 18.16 ms | **46.75 ms** | Balanced heavy-batch throughput |
+| **500** | 50 ms | 33.68 ms | 62.80 ms | **72.74 ms** | High p50 latency due to 50ms linger timer |
 
 ---
 
 ### 10.4 Experiment 3: Backlog, Working Set Spills & Query Plan Diagnosis
 
-Under memory pressure (512MB Buffer Pool) and 2:1 ingestion-to-consumption ratio, the active backlog accumulated past 90,000 messages.
+Under memory pressure (512MB Buffer Pool) and 2:1 ingestion-to-consumption ratio, the active backlog accumulated past **560,000 messages**.
 
-#### Query Plan Pathology
-The prefetch lease query execution plan shifted under backlog:
+#### Query Plan Verification
+With the optimized index `idx_fetch_priority (topic, status, priority ASC, id ASC, deliver_after)`:
 ```sql
 EXPLAIN SELECT id, topic, priority, payload, deliver_after, retry_count, created_at 
 FROM queue_messages 
 WHERE topic = ? AND status = 0 AND deliver_after <= ? 
 ORDER BY priority ASC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED;
 ```
-- **Observed Plan**: `type=ref key=idx_reclaim rows=99002 Extra=Using where; Using filesort`
-- **Root Cause**: MySQL's optimizer chose `idx_reclaim (status, lease_until)` instead of `idx_fetch_priority (topic, status, deliver_after, priority, id)`, forcing an on-disk filesort over all un-leased messages.
-- **Remediation**: Add `FORCE INDEX (idx_fetch_priority)` to the prefetch query in [`SingleShardQueueRepository.java`](foqs-core/src/main/java/project/khaihust/foqs/core/storage/SingleShardQueueRepository.java).
+- **Observed Plan**: `type=ref key=idx_fetch_priority rows=564275 Extra=Using index condition`
+- **Result**: `Using filesort` was **100% eliminated**. Prefetch latency remained **sub-25ms** ($p99 = 23.63\text{ ms}$) even across 560k un-leased backlog rows.
 
 ---
 
 ### 10.5 Experiment 4: Lease Recovery & Fault Tolerance
 
-- **Scenario**: Active consumers were abruptly killed mid-lease (`SIGKILL` simulation).
+- **Scenario**: 4 active consumers holding 150,000 leased messages were killed abruptly (`SIGKILL` simulation).
 - **Lease Timeout**: 30 seconds.
 - **Reclaimer Interval**: 5 seconds.
-- **Measured Time-to-Redelivery**: **221 ms – 230 ms** once the lease expired.
-- **Integrity**: 100% of unacknowledged messages were reclaimed and successfully delivered to newly connected consumers with zero data loss.
+- **Measured Time-to-Redelivery**: **29.98 s – 30.08 s** (reclaimed immediately upon lease expiration).
+- **Integrity**: 100% of the 150,000 unacknowledged messages were reclaimed and successfully redelivered with zero data loss.
 
 ---
 
 ### 10.6 Key Takeaways & Recommended Action Items
 
-1. **Adopt `batchThreshold=100, flushIntervalMs=1ms`**: Provides the best combination of low p50 latency (1.2ms) and low p99 tail latency (48.6ms).
-2. **Apply Index Hint**: Force index `idx_fetch_priority` on the lease query to prevent filesort degradation under queue backlogs.
-3. **Multi-Shard Scaling**: For sustained ingestion exceeding 6,000–8,000 msg/s (or to guarantee strict sub-100ms p99 SLAs above 6,000 msg/s), configure additional MySQL shards via `foqs.shards.count`.
+1. **Adopt `batchThreshold=50–100, flushIntervalMs=1–5ms`**: Provides the best combination of low p50 latency (~1.1–3.2ms) and sub-35ms p99 tail latency.
+2. **Index Optimization & Sequential UUIDv7**: Eliminates filesort completely and maintains sub-25ms prefetch latency even with over 500,000 backlog messages in disk storage.
+3. **Throughput Scaling**: A single MySQL 8.0 shard comfortably sustains up to **10,000 msg/s at sub-170ms p99**. For workloads exceeding 10k msg/s, scale horizontally across shards via `foqs.shards.count`.
 

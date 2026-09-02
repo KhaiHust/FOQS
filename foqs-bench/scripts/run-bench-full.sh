@@ -22,7 +22,7 @@ MYSQL_URL="jdbc:mysql://localhost:3306/foqs_shard_0?useSSL=false&allowPublicKeyR
 MYSQL_USER="root"
 MYSQL_PASS="root"
 SERVER_PORT=8080
-OUTPUT="bench-results.csv"
+OUTPUT="${OUTPUT:-foqs-bench/src/main/resources/bench-results.csv}"
 REPEATS="${REPEATS:-2}"
 WARMUP="${WARMUP:-20}"
 DURATION="${DURATION:-60}"
@@ -217,10 +217,20 @@ start_mysql 4294967296  # 4GB buffer pool
 run_migration
 
 # ═══════════════════════════════════════════════════════════════
-#  Experiment 1: Baseline Ramp (Already completed, skipping)
+#  Experiment 1: Baseline Ramp
 # ═══════════════════════════════════════════════════════════════
 
-log "━━━ EXPERIMENT 1: BASELINE RAMP (Skipped - already captured in bench-results.csv) ━━━"
+log "━━━ EXPERIMENT 1: BASELINE RAMP ━━━"
+start_server 100 10 20
+
+BASELINE_RATES=(1000 5000 6000 7000 8000 10000)
+for rate in "${BASELINE_RATES[@]}"; do
+    for repeat in $(seq 0 $((REPEATS - 1))); do
+        run_bench "baseline" "$rate" "$repeat" 100 10 20 "4G"
+    done
+done
+
+log "Baseline ramp complete."
 
 # ═══════════════════════════════════════════════════════════════
 #  Experiment 2: Batch Sweep

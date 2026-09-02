@@ -3,4 +3,5 @@
 target/
 *.log
 *.csv
+!foqs-bench/src/main/resources/*.csv
 dependency-reduced-pom.xml

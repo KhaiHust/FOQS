@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS queue_messages (
     retry_count INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
-    INDEX idx_fetch_priority (topic, status, deliver_after, priority ASC, id ASC),
-    INDEX idx_reclaim (status, lease_until)
+    INDEX idx_fetch_priority (topic, status, priority ASC, id ASC, deliver_after),
+    INDEX idx_reclaim (lease_until, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --rollback DROP TABLE IF EXISTS queue_messages;
