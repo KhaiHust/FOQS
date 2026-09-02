@@ -28,7 +28,7 @@ public class ConsumerWorker implements Runnable {
     private static final Logger logger = LoggerFactory.getLogger(ConsumerWorker.class);
 
     private final ChannelPool channelPool;
-    private final String topic;
+    private final List<String> topics;
     private final int batchSize;
     private final int timeoutMs;
     private final boolean ackMessages;
@@ -40,6 +40,32 @@ public class ConsumerWorker implements Runnable {
 
     private volatile boolean stopped = false;
     private volatile long firstDequeueAfterResumeNs = 0;
+    private int topicIndex = 0;
+
+    public ConsumerWorker(ChannelPool channelPool,
+                          List<String> topics,
+                          int batchSize,
+                          int timeoutMs,
+                          boolean ackMessages,
+                          int maxRatePerSec,
+                          int topicOffset) {
+        this.channelPool = channelPool;
+        this.topics = (topics == null || topics.isEmpty()) ? List.of("bench-topic") : List.copyOf(topics);
+        this.batchSize = batchSize;
+        this.timeoutMs = timeoutMs;
+        this.ackMessages = ackMessages;
+        this.maxRatePerSec = maxRatePerSec;
+        this.topicIndex = topicOffset;
+    }
+
+    public ConsumerWorker(ChannelPool channelPool,
+                          List<String> topics,
+                          int batchSize,
+                          int timeoutMs,
+                          boolean ackMessages,
+                          int maxRatePerSec) {
+        this(channelPool, topics, batchSize, timeoutMs, ackMessages, maxRatePerSec, 0);
+    }
 
     public ConsumerWorker(ChannelPool channelPool,
                           String topic,
@@ -47,19 +73,14 @@ public class ConsumerWorker implements Runnable {
                           int timeoutMs,
                           boolean ackMessages,
                           int maxRatePerSec) {
-        this.channelPool = channelPool;
-        this.topic = topic;
-        this.batchSize = batchSize;
-        this.timeoutMs = timeoutMs;
-        this.ackMessages = ackMessages;
-        this.maxRatePerSec = maxRatePerSec;
+        this(channelPool, List.of(topic), batchSize, timeoutMs, ackMessages, maxRatePerSec, 0);
     }
 
     @Override
     public void run() {
         Thread.currentThread().setName("consumer-" + Thread.currentThread().getId());
-        logger.info("Consumer started: topic={}, batchSize={}, ack={}, maxRate={}",
-                topic, batchSize, ackMessages, maxRatePerSec > 0 ? maxRatePerSec : "unlimited");
+        logger.info("Consumer started: topicsCount={}, batchSize={}, ack={}, maxRate={}",
+                topics.size(), batchSize, ackMessages, maxRatePerSec > 0 ? maxRatePerSec : "unlimited");
 
         var dequeueStub = DequeueServiceGrpc.newBlockingStub(channelPool.getChannel());
 
@@ -83,12 +104,15 @@ public class ConsumerWorker implements Runnable {
                     }
                 }
 
+                String currentTopic = topics.get((topicIndex++) % topics.size());
+                int effectiveTimeout = topics.size() > 1 ? Math.min(timeoutMs, 10) : timeoutMs;
+
                 // Dequeue a batch
                 DequeueResponseDto response = dequeueStub.dequeue(
                         DequeueRequestDto.newBuilder()
-                                .setTopic(topic)
+                                .setTopic(currentTopic)
                                 .setCount(batchSize)
-                                .setTimeout(timeoutMs)
+                                .setTimeout(effectiveTimeout)
                                 .build()
                 );
 

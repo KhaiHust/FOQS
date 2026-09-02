@@ -62,7 +62,7 @@ public class OpenLoopLoadGenerator {
     private final int measurementSeconds;
     private final int payloadBytes;
     private final int maxInflight;
-    private final String topic;
+    private final java.util.List<String> topics;
 
     // -- Recording state (reset per run) --
     private final Recorder recorder;
@@ -77,18 +77,28 @@ public class OpenLoopLoadGenerator {
                                  int measurementSeconds,
                                  int payloadBytes,
                                  int maxInflight,
-                                 String topic) {
+                                 java.util.List<String> topics) {
         this.channelPool = channelPool;
         this.targetRate = targetRate;
         this.warmupSeconds = warmupSeconds;
         this.measurementSeconds = measurementSeconds;
         this.payloadBytes = payloadBytes;
         this.maxInflight = maxInflight;
-        this.topic = topic;
+        this.topics = (topics == null || topics.isEmpty()) ? java.util.List.of("bench-topic") : java.util.List.copyOf(topics);
         this.semaphore = new Semaphore(maxInflight);
         // HdrHistogram Recorder: thread-safe, double-buffered.
         // Range: 1μs – 60s, 3 significant figures.
         this.recorder = new Recorder(MIN_LATENCY_US, MAX_LATENCY_US, 3);
+    }
+
+    public OpenLoopLoadGenerator(ChannelPool channelPool,
+                                 int targetRate,
+                                 int warmupSeconds,
+                                 int measurementSeconds,
+                                 int payloadBytes,
+                                 int maxInflight,
+                                 String topic) {
+        this(channelPool, targetRate, warmupSeconds, measurementSeconds, payloadBytes, maxInflight, java.util.List.of(topic));
     }
 
     /**
@@ -148,7 +158,7 @@ public class OpenLoopLoadGenerator {
                     break;
                 }
 
-                sendAsync(payload, intendedSendTimeNs, pastWarmup);
+                sendAsync(payload, intendedSendTimeNs, pastWarmup, sentCount);
                 sentCount++;
             }
 
@@ -190,9 +200,11 @@ public class OpenLoopLoadGenerator {
      * Send one enqueue RPC asynchronously.
      * The callback records latency against the intended send time.
      */
-    private void sendAsync(ByteString payload, long intendedSendTimeNs, boolean recording) {
+    private void sendAsync(ByteString payload, long intendedSendTimeNs, boolean recording, long msgIndex) {
         var channel = channelPool.getChannel();
         var stub = EnqueueServiceGrpc.newStub(channel);
+
+        String topic = topics.get((int) (msgIndex % topics.size()));
 
         var request = EnqueueRequestDto.newBuilder()
                 .setTopic(topic)

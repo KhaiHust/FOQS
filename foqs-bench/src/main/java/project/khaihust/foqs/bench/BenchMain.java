@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.*;
 import java.util.concurrent.*;
@@ -37,6 +38,7 @@ public class BenchMain {
     private static final int DEF_CHANNELS = 8;
     private static final int DEF_MAX_INFLIGHT = 2048;
     private static final String DEF_TOPIC = "bench-topic";
+    private static final int DEF_TOPICS = 60;
     private static final String DEF_OUTPUT = "bench-results.csv";
     private static final int DEF_CONSUMERS = 4;
     private static final int DEF_CONSUMER_BATCH = 100;
@@ -67,10 +69,22 @@ public class BenchMain {
         int channels = Integer.parseInt(opt(opts, "channels", String.valueOf(DEF_CHANNELS)));
         int maxInflight = Integer.parseInt(opt(opts, "max-inflight", String.valueOf(DEF_MAX_INFLIGHT)));
         String topic = opt(opts, "topic", DEF_TOPIC);
+        int topicCount = Integer.parseInt(opt(opts, "topics", String.valueOf(DEF_TOPICS)));
         String output = opt(opts, "output", DEF_OUTPUT);
         int consumers = Integer.parseInt(opt(opts, "consumers", String.valueOf(DEF_CONSUMERS)));
         int consumerBatch = Integer.parseInt(opt(opts, "consumer-batch", String.valueOf(DEF_CONSUMER_BATCH)));
         int consumerRate = Integer.parseInt(opt(opts, "consumer-rate", String.valueOf(DEF_CONSUMER_RATE)));
+
+        // Topics list
+        List<String> topics;
+        if (topicCount <= 1) {
+            topics = List.of(topic);
+        } else {
+            topics = new ArrayList<>();
+            for (int i = 0; i < topicCount; i++) {
+                topics.add(topic + "-" + i);
+            }
+        }
 
         // Metadata (recorded in CSV, do not affect bench behavior)
         int shardCount = Integer.parseInt(opt(opts, "shard-count", String.valueOf(DEF_SHARD_COUNT)));
@@ -86,6 +100,18 @@ public class BenchMain {
         String mysqlUser = opt(opts, "mysql-user", DEF_MYSQL_USER);
         String mysqlPass = opt(opts, "mysql-password", DEF_MYSQL_PASS);
 
+        List<String> mysqlUrls = new ArrayList<>();
+        String mysqlUrlsOpt = opt(opts, "mysql-urls", null);
+        if (mysqlUrlsOpt != null && !mysqlUrlsOpt.isBlank()) {
+            mysqlUrls.addAll(Arrays.stream(mysqlUrlsOpt.split(",")).map(String::trim).toList());
+        } else if (shardCount > 1) {
+            for (int i = 0; i < shardCount; i++) {
+                mysqlUrls.add("jdbc:mysql://localhost:" + (3306 + i) + "/foqs_shard_" + i + "?useSSL=false&allowPublicKeyRetrieval=true");
+            }
+        } else {
+            mysqlUrls.add(mysqlUrl);
+        }
+
         // Resolve git SHA
         String gitSha = resolveGitSha();
 
@@ -99,32 +125,34 @@ public class BenchMain {
         logger.info("║ Consumers    : {}   Payload : {}B", consumers, payloadBytes);
         logger.info("║ Batch thresh : {}   Flush   : {}ms", batchThreshold, flushIntervalMs);
         logger.info("║ Repeat       : {}   Git     : {}", repeatIndex, gitSha);
+        logger.info("║ Topics       : {} (count={})", topic, topicCount);
+        logger.info("║ Shards       : count={} urls={}", shardCount, mysqlUrls);
         logger.info("╚══════════════════════════════════════════╝");
 
         switch (experiment) {
             case "baseline", "batch_sweep", "smoke" ->
                     runStandardExperiment(
                             host, port, warmup, duration, payloadBytes, channels, maxInflight,
-                            topic, output, consumers, consumerBatch, consumerRate,
+                            topics, topicCount, output, consumers, consumerBatch, consumerRate,
                             shardCount, bufferPoolSize, batchThreshold, flushIntervalMs,
                             maxPoolSize, jvmFlags, repeatIndex, targetRate, experiment,
-                            gitSha, mysqlUrl, mysqlUser, mysqlPass
+                            gitSha, mysqlUrls, mysqlUser, mysqlPass
                     );
             case "backlog" ->
                     runBacklogExperiment(
                             host, port, warmup, duration, payloadBytes, channels, maxInflight,
-                            topic, output, consumers, consumerBatch,
+                            topics, topicCount, output, consumers, consumerBatch,
                             shardCount, bufferPoolSize, batchThreshold, flushIntervalMs,
                             maxPoolSize, jvmFlags, repeatIndex, targetRate, experiment,
-                            gitSha, mysqlUrl, mysqlUser, mysqlPass
+                            gitSha, mysqlUrls, mysqlUser, mysqlPass
                     );
             case "lease_recovery" ->
                     runLeaseRecoveryExperiment(
                             host, port, payloadBytes, channels, maxInflight,
-                            topic, output, consumers, consumerBatch,
+                            topics, topicCount, output, consumers, consumerBatch,
                             shardCount, bufferPoolSize, batchThreshold, flushIntervalMs,
                             maxPoolSize, jvmFlags, repeatIndex, targetRate,
-                            gitSha, mysqlUrl, mysqlUser, mysqlPass
+                            gitSha, mysqlUrls, mysqlUser, mysqlPass
                     );
             default -> {
                 logger.error("Unknown experiment: {}. Valid: baseline, batch_sweep, backlog, lease_recovery, smoke", experiment);
@@ -138,27 +166,31 @@ public class BenchMain {
     // ═══════════════════════════════════════════════════════════════
     private static void runStandardExperiment(
             String host, int port, int warmup, int duration, int payloadBytes,
-            int channels, int maxInflight, String topic, String output,
+            int channels, int maxInflight, List<String> topics, int topicCount, String output,
             int numConsumers, int consumerBatch, int consumerRate,
             int shardCount, String bufferPoolSize, int batchThreshold, int flushIntervalMs,
             int maxPoolSize, String jvmFlags, int repeatIndex, int targetRate,
             String experiment, String gitSha,
-            String mysqlUrl, String mysqlUser, String mysqlPass
+            List<String> mysqlUrls, String mysqlUser, String mysqlPass
     ) throws Exception {
 
-        // Purge queue before run
-        truncateQueue(mysqlUrl, mysqlUser, mysqlPass);
+        // Purge queue before run across all shards
+        truncateAllQueues(mysqlUrls, mysqlUser, mysqlPass);
 
-        ExplainCapture explain = new ExplainCapture(mysqlUrl, mysqlUser, mysqlPass);
+        ExplainCapture explain = new ExplainCapture(mysqlUrls.get(0), mysqlUser, mysqlPass);
 
-        try (ChannelPool pool = new ChannelPool(host, port, channels);
+        try (CpuSampler cpuSampler = new CpuSampler();
+             ChannelPool pool = new ChannelPool(host, port, channels);
              CsvResultWriter csv = new CsvResultWriter(Path.of(output))) {
+
+            cpuSampler.start();
 
             // Start consumers at full speed (or specified rate) to drain the queue
             List<ConsumerWorker> consumers = new ArrayList<>();
             List<Thread> consumerThreads = new ArrayList<>();
             for (int i = 0; i < numConsumers; i++) {
-                var worker = new ConsumerWorker(pool, topic, consumerBatch, 1000, true, consumerRate);
+                int offset = i * (topics.size() / Math.max(1, numConsumers));
+                var worker = new ConsumerWorker(pool, topics, consumerBatch, 1000, true, consumerRate, offset);
                 var thread = new Thread(worker, "consumer-" + i);
                 thread.setDaemon(true);
                 thread.start();
@@ -168,7 +200,7 @@ public class BenchMain {
 
             // Run open-loop generator
             var generator = new OpenLoopLoadGenerator(
-                    pool, targetRate, warmup, duration, payloadBytes, maxInflight, topic);
+                    pool, targetRate, warmup, duration, payloadBytes, maxInflight, topics);
             BenchmarkResult result = generator.run();
 
             // Compute dequeue throughput
@@ -183,10 +215,26 @@ public class BenchMain {
             consumerThreads.forEach(t -> t.interrupt());
             for (Thread t : consumerThreads) t.join(5000);
 
-            // Build result with dequeue throughput and explain
+            // Shard row counts and skew
+            List<Long> rowsPerShard = countRowsPerShard(mysqlUrls, mysqlUser, mysqlPass);
+            long totalRows = rowsPerShard.stream().mapToLong(Long::longValue).sum();
+            double observedShardSkew = 0.0;
+            if (shardCount > 1 && totalRows > 0) {
+                double even = (double) totalRows / shardCount;
+                double maxDev = 0.0;
+                for (long c : rowsPerShard) {
+                    maxDev = Math.max(maxDev, Math.abs(c - even) / even);
+                }
+                observedShardSkew = maxDev;
+            }
+            String messagesPerShard = rowsPerShard.toString();
+            double hostCpuPct = cpuSampler.getAverageCpuPct();
+
+            // Build result with dequeue throughput, explain, topics, skew, cpu, shard counts
             BenchmarkResult finalResult = new BenchmarkResult(
                     result.histogram(), result.successCount(), result.errorCount(),
-                    result.measurementDurationMs(), dequeueTps, explainResult
+                    result.measurementDurationMs(), dequeueTps, explainResult,
+                    topicCount, observedShardSkew, hostCpuPct, messagesPerShard
             );
 
             csv.writeRow(gitSha, shardCount, bufferPoolSize, batchThreshold, flushIntervalMs,
@@ -201,32 +249,36 @@ public class BenchMain {
     // ═══════════════════════════════════════════════════════════════
     private static void runBacklogExperiment(
             String host, int port, int warmup, int duration, int payloadBytes,
-            int channels, int maxInflight, String topic, String output,
+            int channels, int maxInflight, List<String> topics, int topicCount, String output,
             int numConsumers, int consumerBatch,
             int shardCount, String bufferPoolSize, int batchThreshold, int flushIntervalMs,
             int maxPoolSize, String jvmFlags, int repeatIndex, int targetRate,
             String experiment, String gitSha,
-            String mysqlUrl, String mysqlUser, String mysqlPass
+            List<String> mysqlUrls, String mysqlUser, String mysqlPass
     ) throws Exception {
 
-        truncateQueue(mysqlUrl, mysqlUser, mysqlPass);
+        truncateAllQueues(mysqlUrls, mysqlUser, mysqlPass);
 
-        ExplainCapture explain = new ExplainCapture(mysqlUrl, mysqlUser, mysqlPass);
+        ExplainCapture explain = new ExplainCapture(mysqlUrls.get(0), mysqlUser, mysqlPass);
 
         // Start InnoDB monitor for history list length tracking
-        InnodbMonitor monitor = new InnodbMonitor(mysqlUrl, mysqlUser, mysqlPass);
+        InnodbMonitor monitor = new InnodbMonitor(mysqlUrls.get(0), mysqlUser, mysqlPass);
         Path innodbCsv = Path.of("innodb_history_" + System.currentTimeMillis() + ".csv");
         monitor.start(innodbCsv, 10);
 
-        try (ChannelPool pool = new ChannelPool(host, port, channels);
+        try (CpuSampler cpuSampler = new CpuSampler();
+             ChannelPool pool = new ChannelPool(host, port, channels);
              CsvResultWriter csv = new CsvResultWriter(Path.of(output))) {
+
+            cpuSampler.start();
 
             // Consumers throttled to 50% of enqueue rate (= targetRate/2 total across all consumers)
             int consumerRatePerWorker = Math.max(1, targetRate / (2 * numConsumers));
             List<ConsumerWorker> consumers = new ArrayList<>();
             List<Thread> consumerThreads = new ArrayList<>();
             for (int i = 0; i < numConsumers; i++) {
-                var worker = new ConsumerWorker(pool, topic, consumerBatch, 1000, true, consumerRatePerWorker);
+                int offset = i * (topics.size() / Math.max(1, numConsumers));
+                var worker = new ConsumerWorker(pool, topics, consumerBatch, 1000, true, consumerRatePerWorker, offset);
                 var thread = new Thread(worker, "consumer-backlog-" + i);
                 thread.setDaemon(true);
                 thread.start();
@@ -236,7 +288,7 @@ public class BenchMain {
 
             // Run open-loop generator
             var generator = new OpenLoopLoadGenerator(
-                    pool, targetRate, warmup, duration, payloadBytes, maxInflight, topic);
+                    pool, targetRate, warmup, duration, payloadBytes, maxInflight, topics);
             BenchmarkResult result = generator.run();
 
             // Capture EXPLAIN at end (when backlog is large — may show filesort)
@@ -255,9 +307,24 @@ public class BenchMain {
             consumerThreads.forEach(t -> t.interrupt());
             for (Thread t : consumerThreads) t.join(5000);
 
+            List<Long> rowsPerShard = countRowsPerShard(mysqlUrls, mysqlUser, mysqlPass);
+            long totalRows = rowsPerShard.stream().mapToLong(Long::longValue).sum();
+            double observedShardSkew = 0.0;
+            if (shardCount > 1 && totalRows > 0) {
+                double even = (double) totalRows / shardCount;
+                double maxDev = 0.0;
+                for (long c : rowsPerShard) {
+                    maxDev = Math.max(maxDev, Math.abs(c - even) / even);
+                }
+                observedShardSkew = maxDev;
+            }
+            String messagesPerShard = rowsPerShard.toString();
+            double hostCpuPct = cpuSampler.getAverageCpuPct();
+
             BenchmarkResult finalResult = new BenchmarkResult(
                     result.histogram(), result.successCount(), result.errorCount(),
-                    result.measurementDurationMs(), dequeueTps, explainBefore
+                    result.measurementDurationMs(), dequeueTps, explainBefore,
+                    topicCount, observedShardSkew, hostCpuPct, messagesPerShard
             );
 
             csv.writeRow(gitSha, shardCount, bufferPoolSize, batchThreshold, flushIntervalMs,
@@ -274,23 +341,26 @@ public class BenchMain {
     // ═══════════════════════════════════════════════════════════════
     private static void runLeaseRecoveryExperiment(
             String host, int port, int payloadBytes,
-            int channels, int maxInflight, String topic, String output,
+            int channels, int maxInflight, List<String> topics, int topicCount, String output,
             int numConsumers, int consumerBatch,
             int shardCount, String bufferPoolSize, int batchThreshold, int flushIntervalMs,
             int maxPoolSize, String jvmFlags, int repeatIndex, int targetRate,
             String gitSha,
-            String mysqlUrl, String mysqlUser, String mysqlPass
+            List<String> mysqlUrls, String mysqlUser, String mysqlPass
     ) throws Exception {
 
-        truncateQueue(mysqlUrl, mysqlUser, mysqlPass);
+        truncateAllQueues(mysqlUrls, mysqlUser, mysqlPass);
 
-        try (ChannelPool pool = new ChannelPool(host, port, channels);
+        try (CpuSampler cpuSampler = new CpuSampler();
+             ChannelPool pool = new ChannelPool(host, port, channels);
              CsvResultWriter csv = new CsvResultWriter(Path.of(output))) {
+
+            cpuSampler.start();
 
             // Phase 1: Enqueue messages (30s burst to fill the queue)
             logger.info("═══ Lease Recovery Phase 1: Enqueue burst (30s) ═══");
             var generator = new OpenLoopLoadGenerator(
-                    pool, targetRate, 0, 30, payloadBytes, maxInflight, topic);
+                    pool, targetRate, 0, 30, payloadBytes, maxInflight, topics);
             generator.run();
 
             // Phase 2: Start consumers that DON'T ack (they hold leases)
@@ -298,7 +368,8 @@ public class BenchMain {
             List<ConsumerWorker> noAckConsumers = new ArrayList<>();
             List<Thread> noAckThreads = new ArrayList<>();
             for (int i = 0; i < numConsumers; i++) {
-                var worker = new ConsumerWorker(pool, topic, consumerBatch, 2000, false, 0);
+                int offset = i * (topics.size() / Math.max(1, numConsumers));
+                var worker = new ConsumerWorker(pool, topics, consumerBatch, 2000, false, 0, offset);
                 var thread = new Thread(worker, "consumer-noack-" + i);
                 thread.setDaemon(true);
                 thread.start();
@@ -324,7 +395,7 @@ public class BenchMain {
             // So worst case redelivery = 30s (lease) + 5s (reclaimer scan) + ~1s (prefetch refill)
             // We wait up to 60s for a redelivery.
 
-            ConsumerWorker recoveryWorker = new ConsumerWorker(pool, topic, consumerBatch, 5000, true, 0);
+            ConsumerWorker recoveryWorker = new ConsumerWorker(pool, topics, consumerBatch, 5000, true, 0);
             Thread recoveryThread = new Thread(recoveryWorker, "consumer-recovery");
             recoveryThread.setDaemon(true);
             recoveryThread.start();
@@ -349,6 +420,20 @@ public class BenchMain {
             recoveryThread.interrupt();
             recoveryThread.join(3000);
 
+            List<Long> rowsPerShard = countRowsPerShard(mysqlUrls, mysqlUser, mysqlPass);
+            long totalRows = rowsPerShard.stream().mapToLong(Long::longValue).sum();
+            double observedShardSkew = 0.0;
+            if (shardCount > 1 && totalRows > 0) {
+                double even = (double) totalRows / shardCount;
+                double maxDev = 0.0;
+                for (long c : rowsPerShard) {
+                    maxDev = Math.max(maxDev, Math.abs(c - even) / even);
+                }
+                observedShardSkew = maxDev;
+            }
+            String messagesPerShard = rowsPerShard.toString();
+            double hostCpuPct = cpuSampler.getAverageCpuPct();
+
             // Create a minimal result for CSV (p99 = redelivery time)
             Histogram h = new Histogram(1, 60_000_000L, 3);
             if (redeliveryTimeMs > 0) {
@@ -357,7 +442,8 @@ public class BenchMain {
             BenchmarkResult result = new BenchmarkResult(
                     h, leasedCount, redeliveryTimeMs < 0 ? 1 : 0,
                     60_000, // 60s window
-                    0, "lease_recovery: " + redeliveryTimeMs + "ms"
+                    0, "lease_recovery: " + redeliveryTimeMs + "ms",
+                    topicCount, observedShardSkew, hostCpuPct, messagesPerShard
             );
 
             csv.writeRow(gitSha, shardCount, bufferPoolSize, batchThreshold, flushIntervalMs,
@@ -371,15 +457,40 @@ public class BenchMain {
     //  Helpers
     // ═══════════════════════════════════════════════════════════════
 
+    private static void truncateAllQueues(List<String> urls, String user, String pass) {
+        for (String url : urls) {
+            truncateQueue(url, user, pass);
+        }
+    }
+
     private static void truncateQueue(String url, String user, String pass) {
-        logger.info("Purging queue_messages...");
+        logger.info("Purging queue_messages on {}...", url);
         try (Connection conn = DriverManager.getConnection(url, user, pass);
              Statement stmt = conn.createStatement()) {
             stmt.executeUpdate("TRUNCATE TABLE queue_messages");
-            logger.info("queue_messages truncated.");
+            logger.info("queue_messages truncated on {}.", url);
         } catch (Exception e) {
-            logger.warn("TRUNCATE failed (table may not exist yet): {}", e.getMessage());
+            logger.warn("TRUNCATE failed on {} (table may not exist yet): {}", url, e.getMessage());
         }
+    }
+
+    private static List<Long> countRowsPerShard(List<String> urls, String user, String pass) {
+        List<Long> counts = new ArrayList<>();
+        for (String url : urls) {
+            try (Connection conn = DriverManager.getConnection(url, user, pass);
+                 Statement stmt = conn.createStatement();
+                 ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM queue_messages")) {
+                if (rs.next()) {
+                    counts.add(rs.getLong(1));
+                } else {
+                    counts.add(0L);
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to count rows on {}: {}", url, e.getMessage());
+                counts.add(0L);
+            }
+        }
+        return counts;
     }
 
     private static void printSummary(BenchmarkResult r, int targetRate) {
@@ -387,13 +498,17 @@ public class BenchMain {
         logger.info("│          BENCHMARK RESULTS              │");
         logger.info("├─────────────────────────────────────────┤");
         logger.info("│ Target rate     : {} msg/s", targetRate);
-        logger.info("│ Achieved rate   : {} msg/s", String.format("%.0f", r.achievedThroughput()));
-        logger.info("│ Dequeue rate    : {} msg/s", String.format("%.0f", r.dequeueThroughput()));
-        logger.info("│ p50 latency     : {} ms", String.format("%.3f", r.p50Ms()));
-        logger.info("│ p95 latency     : {} ms", String.format("%.3f", r.p95Ms()));
-        logger.info("│ p99 latency     : {} ms", String.format("%.3f", r.p99Ms()));
-        logger.info("│ p99.9 latency   : {} ms", String.format("%.3f", r.p999Ms()));
+        logger.info("│ Achieved rate   : {} msg/s", String.format(Locale.ROOT, "%.0f", r.achievedThroughput()));
+        logger.info("│ Dequeue rate    : {} msg/s", String.format(Locale.ROOT, "%.0f", r.dequeueThroughput()));
+        logger.info("│ p50 latency     : {} ms", String.format(Locale.ROOT, "%.3f", r.p50Ms()));
+        logger.info("│ p95 latency     : {} ms", String.format(Locale.ROOT, "%.3f", r.p95Ms()));
+        logger.info("│ p99 latency     : {} ms", String.format(Locale.ROOT, "%.3f", r.p99Ms()));
+        logger.info("│ p99.9 latency   : {} ms", String.format(Locale.ROOT, "%.3f", r.p999Ms()));
         logger.info("│ Error count     : {}", r.errorCount());
+        logger.info("│ Topics          : {}", r.topicCount());
+        logger.info("│ Shard skew      : {}", String.format(Locale.ROOT, "%.2f%%", r.observedShardSkew() * 100));
+        logger.info("│ Host CPU        : {}", String.format(Locale.ROOT, "%.1f%%", r.hostCpuPct()));
+        logger.info("│ Msgs per shard  : {}", r.messagesPerShard());
         logger.info("│ EXPLAIN Extra   : {}", r.explainExtra());
         logger.info("└─────────────────────────────────────────┘");
     }

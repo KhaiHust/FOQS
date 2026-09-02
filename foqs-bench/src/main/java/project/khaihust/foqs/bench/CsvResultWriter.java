@@ -23,7 +23,8 @@ public class CsvResultWriter implements AutoCloseable {
             "gitSha,shardCount,bufferPoolSize,batchThreshold,flushIntervalMs," +
             "maxPoolSize,jvmFlags,targetRate,payloadBytes,timestamp," +
             "experiment,achievedThroughput,p50,p95,p99,p999," +
-            "errorCount,repeatIndex,dequeueThroughput,explainExtra";
+            "errorCount,repeatIndex,dequeueThroughput,explainExtra," +
+            "topicCount,observedShardSkew,hostCpuPct,messagesPerShard";
 
     private final Writer writer;
 
@@ -63,6 +64,7 @@ public class CsvResultWriter implements AutoCloseable {
         // Quote fields that may contain commas or special chars
         String safeJvmFlags = quote(jvmFlags);
         String safeExplain = quote(result.explainExtra() != null ? result.explainExtra() : "");
+        String safeMessagesPerShard = quote(result.messagesPerShard() != null ? result.messagesPerShard() : "");
 
         String row = String.join(",",
                 gitSha,
@@ -76,15 +78,19 @@ public class CsvResultWriter implements AutoCloseable {
                 String.valueOf(payloadBytes),
                 timestamp,
                 experiment,
-                String.format("%.2f", result.achievedThroughput()),
-                String.format("%.3f", result.p50Ms()),
-                String.format("%.3f", result.p95Ms()),
-                String.format("%.3f", result.p99Ms()),
-                String.format("%.3f", result.p999Ms()),
+                String.format(java.util.Locale.ROOT, "%.2f", result.achievedThroughput()),
+                String.format(java.util.Locale.ROOT, "%.3f", result.p50Ms()),
+                String.format(java.util.Locale.ROOT, "%.3f", result.p95Ms()),
+                String.format(java.util.Locale.ROOT, "%.3f", result.p99Ms()),
+                String.format(java.util.Locale.ROOT, "%.3f", result.p999Ms()),
                 String.valueOf(result.errorCount()),
                 String.valueOf(repeatIndex),
-                String.format("%.2f", result.dequeueThroughput()),
-                safeExplain
+                String.format(java.util.Locale.ROOT, "%.2f", result.dequeueThroughput()),
+                safeExplain,
+                String.valueOf(result.topicCount()),
+                String.format(java.util.Locale.ROOT, "%.4f", result.observedShardSkew()),
+                String.format(java.util.Locale.ROOT, "%.2f", result.hostCpuPct()),
+                safeMessagesPerShard
         );
 
         writer.write(row + "\n");

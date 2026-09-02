@@ -1,11 +1,15 @@
 package project.khaihust.foqs.core.config;
 
+import com.google.common.hash.HashFunction;
+import com.google.common.hash.Hashing;
+
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.NavigableMap;
 import java.util.TreeMap;
 
 public class ShardRouter {
+    private static final HashFunction HASH_FUNCTION = Hashing.murmur3_128(10);
     private final NavigableMap<Long, Integer> ring = new TreeMap<>();
     private final int virtualNodes;
 
@@ -43,12 +47,7 @@ public class ShardRouter {
     }
 
     private long hash(String key) {
-        var h = 0xcbf29ce484222325L;
-        for (byte b : key.getBytes(StandardCharsets.UTF_8)) {
-            h ^= (b & 0xFF);
-            h *= 0x100000001b3L;
-        }
-        return h;
+        return HASH_FUNCTION.hashString(key, StandardCharsets.UTF_8).asLong();
     }
 
     private String buildKey(int shardId, int virtualId) {

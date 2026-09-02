@@ -18,8 +18,26 @@ public record BenchmarkResult(
         /** Consumer-side achieved throughput (msgs/sec), 0 if no consumers. */
         double dequeueThroughput,
         /** EXPLAIN Extra field for the lease query at capture time. */
-        String explainExtra
+        String explainExtra,
+        /** Number of topics used in benchmark. */
+        int topicCount,
+        /** Observed shard imbalance ratio: max(|c_i - even|)/even. */
+        double observedShardSkew,
+        /** Average host CPU percentage during run. */
+        double hostCpuPct,
+        /** Messages counted on each shard. */
+        String messagesPerShard
 ) {
+    public BenchmarkResult(
+            Histogram histogram,
+            long successCount,
+            long errorCount,
+            long measurementDurationMs,
+            double dequeueThroughput,
+            String explainExtra
+    ) {
+        this(histogram, successCount, errorCount, measurementDurationMs, dequeueThroughput, explainExtra, 1, 0.0, 0.0, "[]");
+    }
     /** Achieved enqueue throughput in msgs/sec. */
     public double achievedThroughput() {
         return (successCount * 1000.0) / measurementDurationMs;
