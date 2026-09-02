@@ -527,24 +527,24 @@ sequenceDiagram
     participant S1 as Repo Shard 1
     participant S2 as Repo Shard 2
 
-    Consumer->>DS: BatchAckRequestDto([idA (Shard 0), idB (Shard 1), idC (unknown)])
+    Consumer->>DS: BatchAckRequestDto(UUIDs: idA on Shard 0, idB on Shard 1, idC unknown)
     
     alt Invalid UUID String
         DS-->>Consumer: gRPC Status.INVALID_ARGUMENT
     else Valid UUIDs
-        Note over DS: remaining = [idA, idB, idC]
-        DS->>S0: ackMessages([idA, idB, idC])
-        S0-->>DS: acked = [idA]
-        Note over DS: allAcked.add(idA); remaining.remove(idA) -> remaining = [idB, idC]
+        Note over DS: Remaining IDs to ACK: idA, idB, idC
+        DS->>S0: ackMessages(idA, idB, idC)
+        S0-->>DS: acked = idA
+        Note over DS: Shard 0 ACKed idA. Remaining: idB, idC
         
-        DS->>S1: ackMessages([idB, idC])
-        S1-->>DS: acked = [idB]
-        Note over DS: allAcked.add(idB); remaining.remove(idB) -> remaining = [idC]
+        DS->>S1: ackMessages(idB, idC)
+        S1-->>DS: acked = idB
+        Note over DS: Shard 1 ACKed idB. Remaining: idC
         
-        DS->>S2: ackMessages([idC])
-        S2-->>DS: acked = []
+        DS->>S2: ackMessages(idC)
+        S2-->>DS: acked = none
         
-        DS-->>Consumer: BatchAckResponseDto(acked=[idA, idB], failed=[idC])
+        DS-->>Consumer: BatchAckResponseDto(acked: idA, idB; failed: idC)
     end
 ```
 
@@ -561,15 +561,15 @@ sequenceDiagram
     participant S1 as Repo Shard 1
     participant S2 as Repo Shard 2
 
-    Consumer->>DS: BatchNackRequestDto([idA, idB], retry_delay=5s, max_retries=3)
+    Consumer->>DS: BatchNackRequestDto(UUIDs: idA, idB; retry_delay=5s, max_retries=3)
     
-    DS->>S0: nackMessages([idA, idB], 5000ms, 3)
+    DS->>S0: nackMessages(idA, idB; 5000ms, 3)
     S0-->>DS: updatedCount = 1 (idA on Shard 0)
     
-    DS->>S1: nackMessages([idA, idB], 5000ms, 3)
+    DS->>S1: nackMessages(idA, idB; 5000ms, 3)
     S1-->>DS: updatedCount = 1 (idB on Shard 1)
     
-    DS->>S2: nackMessages([idA, idB], 5000ms, 3)
+    DS->>S2: nackMessages(idA, idB; 5000ms, 3)
     S2-->>DS: updatedCount = 0
     
     Note over DS: totalSuccess = 1 + 1 + 0 = 2

@@ -24,12 +24,12 @@ flowchart TD
     end
 
     subgraph FOQS ["FOQS Service (gRPC Layer)"]
-        SR["ShardRouter<br/><i>Consistent Hash Ring (MurmurHash3)</i>"]
+        SR["ShardRouter (MurmurHash3 Consistent Hash Ring)"]
 
         subgraph Ingestion ["Write Path (Ingestion)"]
-            WB0["Write Buffer 0"]
-            WB1["Write Buffer 1"]
-            WB2["Write Buffer 2"]
+            WB0["Write Buffer (Shard 0)"]
+            WB1["Write Buffer (Shard 1)"]
+            WB2["Write Buffer (Shard 2)"]
         end
 
         subgraph Consumption ["Read Path (Consumption)"]
@@ -40,14 +40,16 @@ flowchart TD
     end
 
     subgraph Shards ["Storage Shards (MySQL 8.0 InnoDB)"]
-        DB0[("Shard 0 (:3306)")]
-        DB1[("Shard 1 (:3307)")]
-        DB2[("Shard 2 (:3308)")]
+        DB0[("Shard 0 (Port 3306)")]
+        DB1[("Shard 1 (Port 3307)")]
+        DB2[("Shard 2 (Port 3308)")]
     end
 
     %% Enqueue Flow
     P -->|"1. Enqueue(topic, priority, payload)"| SR
-    SR -->|"Route by topic"| WB0 & WB1 & WB2
+    SR -->|"Route topic A"| WB0
+    SR -->|"Route topic B"| WB1
+    SR -->|"Route topic C"| WB2
     WB0 -->|"Micro-Batch INSERT"| DB0
     WB1 -->|"Micro-Batch INSERT"| DB1
     WB2 -->|"Micro-Batch INSERT"| DB2
@@ -55,9 +57,14 @@ flowchart TD
     %% Dequeue Flow
     DB0 -.->|"Proactive Lease Batch"| MH0
     DB1 -.->|"Proactive Lease Batch"| MH1
-    C -->|"2. Dequeue(topic)"| MH0 & MH1
-    C -->|"3. BatchAck / BatchNack"| DB0 & DB1 & DB2
-    LR -.->|"Background Lease Sweep"| DB0 & DB1 & DB2
+    C -->|"2. Dequeue(topic A)"| MH0
+    C -->|"2. Dequeue(topic B)"| MH1
+    C -->|"3. Scatter-gather BatchAck / BatchNack"| DB0
+    C -->|"3. Scatter-gather BatchAck / BatchNack"| DB1
+    C -->|"3. Scatter-gather BatchAck / BatchNack"| DB2
+    LR -.->|"Periodic Sweep"| DB0
+    LR -.->|"Periodic Sweep"| DB1
+    LR -.->|"Periodic Sweep"| DB2
 ```
 
 ### How It Works
