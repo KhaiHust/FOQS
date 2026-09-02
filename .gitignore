@@ -1,2 +1,6 @@
 /.idea/
 /*/target/
+target/
+*.log
+*.csv
+dependency-reduced-pom.xml

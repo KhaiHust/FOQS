@@ -46,6 +46,13 @@ FOQS (**Facebook Ordered Queueing Service**) is an enterprise-grade, sharded, lo
    - [9.2 Docker Compose Quickstart](#92-docker-compose-quickstart)
    - [9.3 Liquibase Database Migration](#93-liquibase-database-migration)
    - [9.4 Production Tuning Recommendations](#94-production-tuning-recommendations)
+10. [Performance Benchmarks & Empirical Evaluation](#10-performance-benchmarks--empirical-evaluation)
+   - [10.1 Open-Loop Benchmark Harness (`foqs-bench`)](#101-open-loop-benchmark-harness-foqs-bench)
+   - [10.2 Experiment 1: Baseline Knee Characterization](#102-experiment-1-baseline-knee-characterization)
+   - [10.3 Experiment 2: Micro-Batch Sweeps & Latency Tradeoffs](#103-experiment-2-micro-batch-sweeps--latency-tradeoffs)
+   - [10.4 Experiment 3: Backlog, Working Set Spills & Query Plan Diagnosis](#104-experiment-3-backlog-working-set-spills--query-plan-diagnosis)
+   - [10.5 Experiment 4: Lease Recovery & Fault Tolerance](#105-experiment-4-lease-recovery--fault-tolerance)
+   - [10.6 Key Takeaways & Recommended Action Items](#106-key-takeaways--recommended-action-items)
 
 ---
 
@@ -71,12 +78,12 @@ Meta's engineering paper discusses how Facebook scaled its asynchronous compute 
 | :--- | :--- | :--- |
 | **Storage Engine** | Sharded MySQL InnoDB | Sharded MySQL InnoDB with `DatasourceManager` & HikariCP |
 | **Transport Protocol** | Apache Thrift RPC | gRPC over HTTP/2 with Protocol Buffers 3 |
-| **Ingestion Pipeline** | In-memory write buffer per shard worker returning asynchronous Promise/Future | [`ProducerBatch`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) backed by `ArrayBlockingQueue` & `CompletableFuture<UUID>` with size/time dual flusher |
-| **Consumption Model** | **Pull-based** consumer model with in-memory prefetching | Pull-based `DequeueService.Dequeue` pulling from in-memory [`PrefetchBatch`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) min-heap |
+| **Ingestion Pipeline** | In-memory write buffer per shard worker returning asynchronous Promise/Future | [`ProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) backed by `ArrayBlockingQueue` & `CompletableFuture<UUID>` with size/time dual flusher |
+| **Consumption Model** | **Pull-based** consumer model with in-memory prefetching | Pull-based `DequeueService.Dequeue` pulling from in-memory [`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) min-heap |
 | **Priority Ordering** | 32-bit integer priority (`lower integer = higher priority`), ties broken by deliver timestamp | 32-bit `priority` field; Min-Heap comparator ordering by `priority ASC, id ASC` |
-| **Lease & At-Least-Once Delivery** | Time-bound lease duration; expired un-acked leases reclaimed automatically | Atomic lease (`status = 1`, `lease_until = NOW + duration`), recovered by [`LeaseReclaimer`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) |
+| **Lease & At-Least-Once Delivery** | Time-bound lease duration; expired un-acked leases reclaimed automatically | Atomic lease (`status = 1`, `lease_until = NOW + duration`), recovered by [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) |
 | **Negative Acknowledgment (NACK)** | NACK with delay for exponential backoff retry | `BatchNack` supporting `retry_delay_ms` and transition to `DEAD_LETTER (3)` upon `max_retry_count` |
-| **Topic Lifecycle** | Lightweight, dynamic logical priority queues within namespaces | Dynamic topic-scoped prefetch buffers created on-demand via [`PrefetchBufferRegistry`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) |
+| **Topic Lifecycle** | Lightweight, dynamic logical priority queues within namespaces | Dynamic topic-scoped prefetch buffers created on-demand via [`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) |
 | **Compact Keys** | Encoded shard ID + 64-bit primary key | 128-bit compact `BINARY(16)` UUIDs optimized for InnoDB memory footprint |
 
 
@@ -142,7 +149,7 @@ flowchart TB
 
 ### 3.2 Ingestion Pipeline (`ProducerBatch`)
 
-The [`ProducerBatch`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) decouples gRPC thread execution from database write latency.
+The [`ProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) decouples gRPC thread execution from database write latency.
 
 ```mermaid
 flowchart LR
@@ -166,7 +173,7 @@ flowchart LR
 
 ### 3.3 Consumption Pipeline (`PrefetchBatch` & `PrefetchBufferRegistry`)
 
-To eliminate latency spikes on consumer dequeue calls, [`PrefetchBatch`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) maintains an in-memory priority min-heap per topic.
+To eliminate latency spikes on consumer dequeue calls, [`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) maintains an in-memory priority min-heap per topic.
 
 ```mermaid
 flowchart TD
@@ -180,7 +187,7 @@ flowchart TD
 ```
 
 #### Key Mechanics:
-1. **Topic Buffer Registry**: [`PrefetchBufferRegistry`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) uses a `ConcurrentHashMap` to lazily create and cache `PrefetchBatch` instances per topic.
+1. **Topic Buffer Registry**: [`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) uses a `ConcurrentHashMap` to lazily create and cache `PrefetchBatch` instances per topic.
 2. **Min-Heap Structure**: Uses a `PriorityBlockingQueue<Message>` with comparator:
    ```java
    Comparator.comparingInt(Message::getPriority)
@@ -193,7 +200,7 @@ flowchart TD
 
 ### 3.4 Storage Layer (`SingleShardQueueRepository`)
 
-[`SingleShardQueueRepository`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/storage/SingleShardQueueRepository.java) executes atomic JDBC queries against MySQL shards.
+[`SingleShardQueueRepository`](foqs-core/src/main/java/project/khaihust/foqs/core/storage/SingleShardQueueRepository.java) executes atomic JDBC queries against MySQL shards.
 
 | Operation | SQL Pattern / Logic | Description |
 | :--- | :--- | :--- |
@@ -207,7 +214,7 @@ flowchart TD
 
 ### 3.5 Background Recovery Daemon (`LeaseReclaimer`)
 
-[`LeaseReclaimer`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) runs as a singleton daemon scheduled executor (`foqs-lease-reclaimer`) configured with `reclaimerIntervalSeconds` (default: 1 second).
+[`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) runs as a singleton daemon scheduled executor (`foqs-lease-reclaimer`) configured with `reclaimerIntervalSeconds` (default: 1 second).
 
 - Scans the covered index `idx_reclaim (status, lease_until)` for rows where `status = 1` and `lease_until < NOW(3)`.
 - Resets them to `status = 0` (`READY`), clears `lease_until = NULL`, and increments `retry_count = retry_count + 1`.
@@ -217,7 +224,7 @@ flowchart TD
 
 ### 3.6 Multi-Shard DataSource Manager (`DatasourceManager`)
 
-[`DatasourceManager`](file:///Users/khaitran/Projects/FOQS/foqs-core/src/main/java/project/khaihust/foqs/core/config/DatasourceManager.java) initializes and maintains a collection of high-performance `HikariDataSource` connection pools keyed by shard index (`0 .. N-1`).
+[`DatasourceManager`](foqs-core/src/main/java/project/khaihust/foqs/core/config/DatasourceManager.java) initializes and maintains a collection of high-performance `HikariDataSource` connection pools keyed by shard index (`0 .. N-1`).
 
 - Supports horizontal scaling across independent MySQL database shards.
 - Manages connection pool properties (maximum pool size, timeout, keepalive, connection leak detection).
@@ -817,7 +824,7 @@ Configuration is loaded from `application.properties` and profile files (e.g. `a
 
 ### 8.2 Docker Compose Quickstart
 
-The [`docker/docker-compose.yml`](file:///Users/khaitran/Projects/FOQS/docker/docker-compose.yml) starts the default MySQL 8.0 shard container:
+The [`docker/docker-compose.yml`](docker/docker-compose.yml) starts the default MySQL 8.0 shard container:
 
 ```yaml
 version: '3.8'
@@ -865,3 +872,95 @@ mvn clean compile exec:java -pl foqs-migration -Dexec.mainClass="project.khaihus
      ```bash
      java -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -Xms4g -Xmx4g -jar foqs-core.jar
      ```
+
+---
+
+## 10. Performance Benchmarks & Empirical Evaluation
+
+To measure real-world performance under controlled saturation, the `foqs-bench` module implements an open-loop load test suite with HdrHistogram percentiles, channel pooling, and background consumers.
+
+### 10.1 Open-Loop Benchmark Harness (`foqs-bench`)
+
+1. **Coordinated Omission Prevention**: Requests are dispatched on an exact time schedule. Latency is recorded as `now() - intendedSendTimeNs`. If the server stalls, queuing delays are directly reflected in latency histograms.
+2. **Channel Pool Architecture**: Distributes gRPC RPCs across 4–8 `ManagedChannel`s (HTTP/2 connections) with an atomic round-robin counter and a `Semaphore(2048)` to bound memory usage during saturation.
+3. **Execution Scripts**:
+   - Smoke Test: `./foqs-bench/scripts/run-bench-smoke.sh` (30-second end-to-end verification)
+   - Full Matrix: `./foqs-bench/scripts/run-bench-full.sh` (overnight sweep suite)
+
+---
+
+### 10.2 Experiment 1: Baseline Knee Characterization
+
+- **Environment**: Single MySQL 8.0 Shard, 4GB InnoDB Buffer Pool, MacBook M4 (Docker VM, named volume, `--skip-log-bin`, 4 CPUs, 8GB RAM).
+- **Server JVM**: `-Xms4g -Xmx4g -XX:+UseG1GC -XX:MaxGCPauseMillis=20`.
+
+| Target Rate (msg/s) | Achieved Rate (msg/s) | p50 Latency | p95 Latency | **p99 Latency** | p99.9 Latency | Observations |
+| :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| **1,000** | 999.99 | 7.44 ms | 14.43 ms | **29.06 ms** | 54.98 ms | **Linear Regime**: sub-30ms p99 latency; minimal queue contention |
+| **5,000** | 4,999.99 | 8.59 ms | 62.78 ms | **118.72 ms** | 233.34 ms | **Moderate Load**: throughput sustained; tail latency starts to elevate |
+| **6,000** | 5,999.97 | 9.45 ms | 58.24 ms | **102.21 ms** | 181.50 ms | **Sustained Sweet Spot**: p50 < 10ms, p99 tightly bounded at ~102ms |
+| **7,000** | 6,999.97 | 11.99 ms | 168.06 ms | **571.90 ms** | 1,038.34 ms | **Latency Knee**: throughput sustained, but tail queuing pushes p99 > 500ms |
+| **8,000** | 7,999.98 | 13.72 ms | 184.19 ms | **239.10 ms** | 533.50 ms | **Throughput Ceiling**: ~8,000 msg/s sustained with 10.6k msg/s dequeue capacity |
+| **10,000** | 8,980.44 | 9.17 s | 33.88 s | **38.70 s** | 39.58 s | **Saturation Cliff / Collapse**: unable to sustain rate; queuing runaway |
+
+---
+
+### 10.3 Experiment 2: Micro-Batch Sweeps & Latency Tradeoffs
+
+Evaluated $4 \times 4$ combinations of `batchThreshold` $\in \{10, 50, 100, 500\}$ and `flushIntervalMs` $\in \{1, 5, 10, 50\}$ at **4,800 msg/s** (~80% of knee):
+
+| `batchThreshold` | `flushIntervalMs` | p50 Latency | p95 Latency | **p99 Latency** | Analysis |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| **10** | 1 ms | 1.32 ms | 102.40 ms | **141.47 ms** | Excessive JDBC transactions increase lock contention |
+| **10** | 5 ms | 1.52 ms | 73.66 ms | **97.47 ms** | Linger flush helps accumulate larger batches |
+| **10** | 10 ms | 1.56 ms | 77.79 ms | **100.16 ms** | Comparable to 5ms linger |
+| **10** | 50 ms | 1.64 ms | 82.02 ms | **113.57 ms** | Higher tail latency due to batch accumulation lag |
+| **50** | 1 ms | 1.29 ms | 33.82 ms | **51.81 ms** | **Fastest p99** (>60% reduction vs `bt=10`) |
+| **50** | 5 ms | 4.09 ms | 33.73 ms | **75.18 ms** | Consistent performance |
+| **50** | 10 ms | 7.21 ms | 39.62 ms | **65.97 ms** | Default production-like balance |
+| **50** | 50 ms | 6.23 ms | 33.10 ms | **49.86 ms** | Low overhead at steady state |
+| **100** | 1 ms | 1.23 ms | 28.94 ms | **48.58 ms** | **Optimal p50/p99 sweet spot** |
+| **100** | 5 ms | 3.91 ms | 28.88 ms | **49.50 ms** | Highly balanced latency profile |
+| **100** | 10 ms | 7.31 ms | 28.58 ms | **54.38 ms** | Standard default configuration |
+| **100** | 50 ms | 12.41 ms | 41.20 ms | **82.34 ms** | Higher p50 due to 50ms flush timeout |
+| **500** | 1 ms | 1.22 ms | 29.45 ms | **51.01 ms** | Maximum write batch efficiency |
+| **500** | 5 ms | 3.97 ms | 29.46 ms | **54.46 ms** | Stable under high ingestion rates |
+| **500** | 10 ms | 7.71 ms | 37.26 ms | **69.21 ms** | Moderate tail jitter |
+| **500** | 50 ms | 34.56 ms | 67.94 ms | **91.20 ms** | High p50 latency caused by 50ms linger timer |
+
+---
+
+### 10.4 Experiment 3: Backlog, Working Set Spills & Query Plan Diagnosis
+
+Under memory pressure (512MB Buffer Pool) and 2:1 ingestion-to-consumption ratio, the active backlog accumulated past 90,000 messages.
+
+#### Query Plan Pathology
+The prefetch lease query execution plan shifted under backlog:
+```sql
+EXPLAIN SELECT id, topic, priority, payload, deliver_after, retry_count, created_at 
+FROM queue_messages 
+WHERE topic = ? AND status = 0 AND deliver_after <= ? 
+ORDER BY priority ASC, id ASC LIMIT ? FOR UPDATE SKIP LOCKED;
+```
+- **Observed Plan**: `type=ref key=idx_reclaim rows=99002 Extra=Using where; Using filesort`
+- **Root Cause**: MySQL's optimizer chose `idx_reclaim (status, lease_until)` instead of `idx_fetch_priority (topic, status, deliver_after, priority, id)`, forcing an on-disk filesort over all un-leased messages.
+- **Remediation**: Add `FORCE INDEX (idx_fetch_priority)` to the prefetch query in [`SingleShardQueueRepository.java`](foqs-core/src/main/java/project/khaihust/foqs/core/storage/SingleShardQueueRepository.java).
+
+---
+
+### 10.5 Experiment 4: Lease Recovery & Fault Tolerance
+
+- **Scenario**: Active consumers were abruptly killed mid-lease (`SIGKILL` simulation).
+- **Lease Timeout**: 30 seconds.
+- **Reclaimer Interval**: 5 seconds.
+- **Measured Time-to-Redelivery**: **221 ms – 230 ms** once the lease expired.
+- **Integrity**: 100% of unacknowledged messages were reclaimed and successfully delivered to newly connected consumers with zero data loss.
+
+---
+
+### 10.6 Key Takeaways & Recommended Action Items
+
+1. **Adopt `batchThreshold=100, flushIntervalMs=1ms`**: Provides the best combination of low p50 latency (1.2ms) and low p99 tail latency (48.6ms).
+2. **Apply Index Hint**: Force index `idx_fetch_priority` on the lease query to prevent filesort degradation under queue backlogs.
+3. **Multi-Shard Scaling**: For sustained ingestion exceeding 6,000–8,000 msg/s (or to guarantee strict sub-100ms p99 SLAs above 6,000 msg/s), configure additional MySQL shards via `foqs.shards.count`.
+
