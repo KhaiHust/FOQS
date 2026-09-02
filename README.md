@@ -6,12 +6,13 @@ FOQS is an enterprise-grade, sharded priority message queue service built with J
 
 ## Key Features
 
-- **High-Throughput Enqueue Pipeline**: In-memory ring buffer (`ProducerBatch`) with asynchronous micro-batch database insertion.
-- **Low-Latency Dequeue Pipeline**: Proactive in-memory Min-Heap prefetching (`PrefetchBatch`) maintaining priority ordering.
-- **Atomic Lease & Acknowledgment Lifecycle**:
-  - `BatchAck`: Atomic completion marking (`status = 2`).
-  - `BatchNack`: Exponential/fixed retry backoff with automatic Dead-Letter Queue (`status = 3`) routing.
-- **Automated Lease Reclamation**: Background `LeaseReclaimer` monitoring expired leases and returning them to `READY` status.
+- **Consistent Hashing Shard Routing**: Deterministic topic-to-shard partitioning via 64-bit FNV-1a hash ring with virtual nodes ([`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java)), enabling horizontal database scaling with zero cross-shard lock contention.
+- **High-Throughput Enqueue Pipeline**: Independent per-shard in-memory ring buffers ([`ShardedProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ShardedProducerBatch.java)) with asynchronous transactional micro-batch database insertion.
+- **Low-Latency Dequeue Pipeline**: Proactive in-memory Min-Heap prefetching ([`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java)) maintaining priority ordering per topic.
+- **Cross-Shard Scatter-Gather ACK & NACK**:
+  - `BatchAck`: Fanned-out atomic completion marking (`status = 2`) across all database shards.
+  - `BatchNack`: Exponential/fixed retry backoff with automatic Dead-Letter Queue (`status = 3`) routing across shards.
+- **Automated Fault-Isolated Lease Reclamation**: Background multi-shard `LeaseReclaimer` monitoring expired leases and returning them to `READY` status with per-shard failure isolation.
 
 ## Quick Start & How to Run
 
@@ -23,9 +24,9 @@ FOQS is an enterprise-grade, sharded priority message queue service built with J
 
 ---
 
-### Step 1: Start MySQL Database Shard
+### Step 1: Start MySQL Database Shards (3-Shard Cluster)
 
-Launch the MySQL 8.0 shard container:
+Launch the MySQL 8.0 shard containers (Shard 0 on port 3306, Shard 1 on port 3307, Shard 2 on port 3308):
 
 ```bash
 docker compose -f docker/docker-compose.yml up -d

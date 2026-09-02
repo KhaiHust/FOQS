@@ -7,17 +7,19 @@ FOQS (**Facebook Ordered Queueing Service**) is an enterprise-grade, sharded, lo
 
 ---
 
-## Table of Contents
+### Table of Contents
 
 1. [Executive Summary & Key Features](#1-executive-summary--key-features)
 2. [Meta FOQS Architectural Heritage & Design Mapping](#2-meta-foqs-architectural-heritage--design-mapping)
 3. [System Architecture & Internals](#3-system-architecture--internals)
-   - [3.1 High-Level Architecture Diagram](#31-high-level-architecture-diagram)
-   - [3.2 Ingestion Pipeline (`ProducerBatch`)](#32-ingestion-pipeline-producerbatch)
-   - [3.3 Consumption Pipeline (`PrefetchBatch` & `PrefetchBufferRegistry`)](#33-consumption-pipeline-prefetchbatch--prefetchbufferregistry)
-   - [3.4 Storage Layer (`SingleShardQueueRepository`)](#34-storage-layer-singleshardqueuerepository)
-   - [3.5 Background Recovery Daemon (`LeaseReclaimer`)](#35-background-recovery-daemon-leasereclaimer)
-   - [3.6 Multi-Shard DataSource Manager (`DatasourceManager`)](#36-multi-shard-datasource-manager-datasourcemanager)
+   - [3.1 High-Level Sharded Architecture Diagram](#31-high-level-sharded-architecture-diagram)
+   - [3.2 Consistent Hashing Shard Router (`ShardRouter`)](#32-consistent-hashing-shard-router-shardrouter)
+   - [3.3 Sharded Ingestion Pipeline (`ShardedProducerBatch` & `ProducerBatch`)](#33-sharded-ingestion-pipeline-shardedproducerbatch--producerbatch)
+   - [3.4 Sharded Consumption Pipeline (`PrefetchBatch` & `PrefetchBufferRegistry`)](#34-sharded-consumption-pipeline-prefetchbatch--prefetchbufferregistry)
+   - [3.5 Cross-Shard Scatter-Gather ACK & NACK Operations (`DequeueService`)](#35-cross-shard-scatter-gather-ack--nack-operations-dequeueservice)
+   - [3.6 Storage Layer (`SingleShardQueueRepository`)](#36-storage-layer-singleshardqueuerepository)
+   - [3.7 Background Recovery Daemon (`LeaseReclaimer`)](#37-background-recovery-daemon-leasereclaimer)
+   - [3.8 Multi-Shard DataSource Manager (`DatasourceManager`)](#38-multi-shard-datasource-manager-datasourcemanager)
 4. [Message Lifecycle & State Machine](#4-message-lifecycle--state-machine)
    - [4.1 State Transition Diagram](#41-state-transition-diagram)
    - [4.2 State Transition Matrix](#42-state-transition-matrix)
@@ -26,11 +28,11 @@ FOQS (**Facebook Ordered Queueing Service**) is an enterprise-grade, sharded, lo
    - [5.2 Index Design & Query Optimization Analysis](#52-index-design--query-optimization-analysis)
    - [5.3 Binary UUID (16-byte) vs String UUID (36-byte) Storage](#53-binary-uuid-16-byte-vs-string-uuid-36-byte-storage)
 6. [End-to-End Workflows & Sequence Diagrams](#6-end-to-end-workflows--sequence-diagrams)
-   - [6.1 Enqueue Workflow (Micro-batching & Backpressure)](#61-enqueue-workflow-micro-batching--backpressure)
-   - [6.2 Prefetch & Dequeue Workflow (In-Memory Min-Heap)](#62-prefetch--dequeue-workflow-in-memory-min-heap)
-   - [6.3 Message Acknowledgment Workflow (`BatchAck`)](#63-message-acknowledgment-workflow-batchack)
-   - [6.4 Negative Acknowledgment & DLQ Workflow (`BatchNack`)](#64-negative-acknowledgment--dlq-workflow-batchnack)
-   - [6.5 Consumer Crash & Automated Lease Recovery Workflow](#65-consumer-crash--automated-lease-recovery-workflow)
+   - [6.1 Multi-Shard Enqueue Workflow (`ShardRouter` & Micro-batching)](#61-multi-shard-enqueue-workflow-shardrouter--micro-batching)
+   - [6.2 Sharded Prefetch & Dequeue Workflow (In-Memory Min-Heap)](#62-sharded-prefetch--dequeue-workflow-in-memory-min-heap)
+   - [6.3 Cross-Shard Scatter-Gather Acknowledgment (`BatchAck`)](#63-cross-shard-scatter-gather-acknowledgment-batchack)
+   - [6.4 Cross-Shard Scatter-Gather Negative Acknowledgment (`BatchNack`)](#64-cross-shard-scatter-gather-negative-acknowledgment-batchnack)
+   - [6.5 Multi-Shard Fault-Isolated Lease Recovery Workflow](#65-multi-shard-fault-isolated-lease-recovery-workflow)
 7. [Complete gRPC API Reference](#7-complete-grpc-api-reference)
    - [7.1 Protocol Buffers Definition](#71-protocol-buffers-definition)
    - [7.2 `EnqueueService.Enqueue`](#72-enqueueserviceenqueue)
@@ -43,7 +45,7 @@ FOQS (**Facebook Ordered Queueing Service**) is an enterprise-grade, sharded, lo
    - [8.2 `grpcurl` CLI Examples](#82-grpcurl-cli-examples)
 9. [Configuration & Deployment Guide](#9-configuration--deployment-guide)
    - [9.1 Configuration Properties Reference](#91-configuration-properties-reference)
-   - [9.2 Docker Compose Quickstart](#92-docker-compose-quickstart)
+   - [9.2 Docker Compose Quickstart (3-Shard Cluster)](#92-docker-compose-quickstart-3-shard-cluster)
    - [9.3 Liquibase Database Migration](#93-liquibase-database-migration)
    - [9.4 Production Tuning Recommendations](#94-production-tuning-recommendations)
 10. [Performance Benchmarks & Empirical Evaluation](#10-performance-benchmarks--empirical-evaluation)
@@ -60,9 +62,11 @@ FOQS (**Facebook Ordered Queueing Service**) is an enterprise-grade, sharded, lo
 
 FOQS provides the ordering and reliability guarantees of a relational database-backed queue while achieving the throughput and low latency of in-memory streaming brokers:
 
-- **Micro-Batched Asynchronous Enqueueing**: Incoming producer messages enter an in-memory `ArrayBlockingQueue` and are flushed to disk in transactional micro-batches. This minimizes database round-trips and drastically reduces lock contention.
+- **Consistent Hashing & Dynamic Shard Striping**: Topics are deterministically partitioned across multiple physical database shards using 64-bit FNV-1a consistent hashing with virtual nodes ([`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java)). Producers write to isolated shard-level write buffers ([`ShardedProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ShardedProducerBatch.java)), and consumers prefetch from shard-routed min-heaps ([`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java)), delivering linear horizontal scalability.
+- **Cross-Shard Scatter-Gather Operations**: Consumer batch ACK and NACK calls support message UUIDs belonging to different physical shards. The service automatically fans out calls across shard repositories and aggregates acknowledgments with zero cross-shard locking penalty.
+- **Micro-Batched Asynchronous Enqueueing**: Incoming producer messages enter an in-memory `ArrayBlockingQueue` per shard and are flushed to disk in transactional micro-batches. This minimizes database round-trips and eliminates lock contention across topics.
 - **In-Memory Priority Min-Heap Prefetching**: For active topics, a dedicated background replenisher proactively leases messages from MySQL and loads them into a thread-safe `PriorityBlockingQueue` ordered by `priority ASC, id ASC`. Consumer `Dequeue` requests are served directly from RAM in $O(1)$ without synchronous database queries.
-- **Strict At-Least-Once Delivery**: Messages are leased with an explicit `lease_until` expiration timestamp. If a consumer crashes or network drops, the message lease expires and the background `LeaseReclaimer` automatically makes the message available again.
+- **Strict At-Least-Once Delivery**: Messages are leased with an explicit `lease_until` expiration timestamp. If a consumer crashes or network drops, the message lease expires and the background `LeaseReclaimer` automatically sweeps and recovers expired messages across all configured shards with fault isolation.
 - **Fine-Grained ACK and NACK**:
   - `BatchAck`: Marks messages as `COMPLETED (2)` and clears leases.
   - `BatchNack`: Allows consumers to reschedule failed messages with customizable backoff delays (`retryDelayMs`) and automatically routes messages exceeding `maxRetryCount` to `DEAD_LETTER (3)` status.
@@ -76,22 +80,22 @@ Meta's engineering paper discusses how Facebook scaled its asynchronous compute 
 
 | Meta FOQS Architecture Concept | Meta Production Design (FB Blog) | Our FOQS Implementation |
 | :--- | :--- | :--- |
-| **Storage Engine** | Sharded MySQL InnoDB | Sharded MySQL InnoDB with `DatasourceManager` & HikariCP |
+| **Storage Engine** | Sharded MySQL InnoDB clusters | Sharded MySQL InnoDB with [`DatasourceManager`](foqs-core/src/main/java/project/khaihust/foqs/core/config/DatasourceManager.java) & HikariCP |
 | **Transport Protocol** | Apache Thrift RPC | gRPC over HTTP/2 with Protocol Buffers 3 |
-| **Ingestion Pipeline** | In-memory write buffer per shard worker returning asynchronous Promise/Future | [`ProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) backed by `ArrayBlockingQueue` & `CompletableFuture<UUID>` with size/time dual flusher |
-| **Consumption Model** | **Pull-based** consumer model with in-memory prefetching | Pull-based `DequeueService.Dequeue` pulling from in-memory [`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) min-heap |
+| **Shard Routing** | Consistent hashing with virtual nodes mapping topics/namespaces to storage shards | [`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java) using FNV-1a 64-bit consistent hash ring with configurable virtual nodes |
+| **Ingestion Pipeline** | In-memory write buffer per shard worker returning asynchronous Promise/Future | [`ShardedProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ShardedProducerBatch.java) delegating to shard-specific [`ProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) instances backed by `ArrayBlockingQueue` & `CompletableFuture<UUID>` |
+| **Consumption Model** | **Pull-based** consumer model with in-memory prefetching | Pull-based `DequeueService.Dequeue` pulling from in-memory [`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) min-heap mapped by [`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) |
 | **Priority Ordering** | 32-bit integer priority (`lower integer = higher priority`), ties broken by deliver timestamp | 32-bit `priority` field; Min-Heap comparator ordering by `priority ASC, id ASC` |
-| **Lease & At-Least-Once Delivery** | Time-bound lease duration; expired un-acked leases reclaimed automatically | Atomic lease (`status = 1`, `lease_until = NOW + duration`), recovered by [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) |
-| **Negative Acknowledgment (NACK)** | NACK with delay for exponential backoff retry | `BatchNack` supporting `retry_delay_ms` and transition to `DEAD_LETTER (3)` upon `max_retry_count` |
-| **Topic Lifecycle** | Lightweight, dynamic logical priority queues within namespaces | Dynamic topic-scoped prefetch buffers created on-demand via [`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) |
+| **Lease & At-Least-Once Delivery** | Time-bound lease duration; expired un-acked leases reclaimed automatically | Atomic lease (`status = 1`, `lease_until = NOW + duration`), recovered across all shards by [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) |
+| **Negative Acknowledgment (NACK)** | NACK with delay for exponential backoff retry | Scatter-gather `BatchNack` supporting `retry_delay_ms` and transition to `DEAD_LETTER (3)` upon `max_retry_count` |
+| **Topic Lifecycle** | Lightweight, dynamic logical priority queues within namespaces | Dynamic topic-scoped prefetch buffers created on-demand and pinned to designated shards |
 | **Compact Keys** | Encoded shard ID + 64-bit primary key | 128-bit compact `BINARY(16)` UUIDs optimized for InnoDB memory footprint |
-
 
 ---
 
-## 2. System Architecture & Internals
+## 3. System Architecture & Internals
 
-### 2.1 High-Level Architecture Diagram
+### 3.1 High-Level Sharded Architecture Diagram
 
 ```mermaid
 flowchart TB
@@ -102,20 +106,24 @@ flowchart TB
 
     subgraph EnqueueLayer ["Ingestion Pipeline (foqs-core)"]
         ES["EnqueueService (gRPC)"]
-        PB["ProducerBatch Buffer (ArrayBlockingQueue)"]
-        Flusher["Scheduled Flusher Worker"]
+        SPB["ShardedProducerBatch"]
+        SR["ShardRouter (Consistent Hash Ring)"]
+        PB0["ProducerBatch Shard 0"]
+        PB1["ProducerBatch Shard 1"]
+        PB2["ProducerBatch Shard 2"]
     end
 
-    subgraph ShardStorage ["Persistence Layer (MySQL 8.0 InnoDB)"]
-        DB[("queue_messages Table (Shard 0 .. N)")]
+    subgraph ShardStorage ["Persistence Layer (MySQL 8.0 InnoDB Shards)"]
+        DB0[("Shard 0 (foqs_shard_0:3306)")]
+        DB1[("Shard 1 (foqs_shard_1:3307)")]
+        DB2[("Shard 2 (foqs_shard_2:3308)")]
     end
 
     subgraph DequeueLayer ["Consumption Pipeline (foqs-core)"]
-        Reclaimer["LeaseReclaimer (Daemon Worker)"]
+        Reclaimer["LeaseReclaimer (Multi-Shard Daemon)"]
         Registry["PrefetchBufferRegistry"]
-        PBatch["PrefetchBatch (Topic-Scoped)"]
-        Heap["Priority Min-Heap (PriorityBlockingQueue)"]
-        Replenisher["Prefetch Replenisher Worker"]
+        PBatch0["PrefetchBatch (Topic A -> Shard 0)"]
+        PBatch1["PrefetchBatch (Topic B -> Shard 1)"]
         DS["DequeueService (gRPC)"]
     end
 
@@ -126,81 +134,160 @@ flowchart TB
 
     P1 -->|"1. gRPC Enqueue"| ES
     P2 -->|"1. gRPC Enqueue"| ES
-    ES -->|"2. offer"| PB
-    PB -.->|"3. Threshold reached OR Timer"| Flusher
-    Flusher -->|"4. Batch INSERT"| DB
+    ES -->|"2. enqueueAsync"| SPB
+    SPB -->|"3. selectShard(topic)"| SR
+    SPB -->|"4a. route to Shard 0"| PB0
+    SPB -->|"4b. route to Shard 1"| PB1
+    SPB -->|"4c. route to Shard 2"| PB2
+    PB0 -->|"5a. Batch INSERT"| DB0
+    PB1 -->|"5b. Batch INSERT"| DB1
+    PB2 -->|"5c. Batch INSERT"| DB2
 
-    Reclaimer -->|"Periodic Scan: UPDATE expired status=0"| DB
+    Reclaimer -->|"Periodic Sweep (Fault-Isolated)"| DB0
+    Reclaimer -->|"Periodic Sweep (Fault-Isolated)"| DB1
+    Reclaimer -->|"Periodic Sweep (Fault-Isolated)"| DB2
 
-    Replenisher -->|"A. Proactive Lease: SELECT ... FOR UPDATE"| DB
-    Replenisher -->|"B. Populate Heap"| Heap
-    PBatch --> Heap
-    Registry --> PBatch
-    C1 -->|"5. gRPC Dequeue"| DS
-    C2 -->|"5. gRPC Dequeue"| DS
-    DS -->|"6. Fast Poll from Memory"| PBatch
-    C1 -->|"7. gRPC BatchAck"| DS
-    DS -->|"8. UPDATE status=2 COMPLETED"| DB
-    C2 -->|"7. gRPC BatchNack"| DS
-    DS -->|"8. UPDATE status=0 READY / 3 DLQ"| DB
+    Registry -->|"selectShard(topic)"| SR
+    Registry -.->|"Connects"| PBatch0
+    Registry -.->|"Connects"| PBatch1
+    PBatch0 -->|"Proactive Lease"| DB0
+    PBatch1 -->|"Proactive Lease"| DB1
+
+    C1 -->|"6. gRPC Dequeue (Topic A)"| DS
+    C2 -->|"6. gRPC Dequeue (Topic B)"| DS
+    DS -->|"7a. Poll Min-Heap"| PBatch0
+    DS -->|"7b. Poll Min-Heap"| PBatch1
+
+    C1 -->|"8. gRPC BatchAck (cross-shard IDs)"| DS
+    C2 -->|"8. gRPC BatchNack (cross-shard IDs)"| DS
+    DS -->|"9. Scatter-gather UPDATE"| DB0
+    DS -->|"9. Scatter-gather UPDATE"| DB1
+    DS -->|"9. Scatter-gather UPDATE"| DB2
 ```
 
 ---
 
-### 3.2 Ingestion Pipeline (`ProducerBatch`)
+### 3.2 Consistent Hashing Shard Router (`ShardRouter`)
 
-The [`ProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) decouples gRPC thread execution from database write latency.
+The [`ShardRouter`](foqs-core/src/main/java/project/khaihust/foqs/core/config/ShardRouter.java) provides deterministic, uniform distribution of topics across database shards without central coordination or runtime network calls.
+
+#### 1. FNV-1a 64-Bit Hashing Algorithm
+`ShardRouter` utilizes the 64-bit Fowler–Noll–Vo (FNV-1a) non-cryptographic hash algorithm:
+```java
+private long hash(String key) {
+    long h = 0xcbf29ce484222325L; // FNV offset basis
+    for (byte b : key.getBytes(StandardCharsets.UTF_8)) {
+        h ^= (b & 0xFF);
+        h *= 0x100000001b3L;       // FNV prime
+    }
+    return h;
+}
+```
+FNV-1a produces excellent avalanche behavior and entropy distribution with negligible CPU cycles (~sub-microsecond execution time).
+
+#### 2. Virtual Node Hash Ring
+To prevent hotspots and preserve uniformity across heterogeneous topic names, each physical shard ID is mapped to multiple virtual nodes on a circular ring:
+- **Virtual Node Key Template**: `"shard-" + shardId + "-vnode-" + virtualId`
+- **Data Structure**: `NavigableMap<Long, Integer> ring = new TreeMap<>()`
+- **Virtual Nodes per Shard**: Configured via constructor (default: 64 virtual nodes per shard).
+
+#### 3. Ring Lookup ($O(\log(K \times V))$)
+When selecting the shard for a topic:
+```java
+public int selectShard(String topic) {
+    long hash = hash(topic);
+    Map.Entry<Long, Integer> entry = ring.ceilingEntry(hash);
+    if (entry == null) {
+        entry = ring.firstEntry(); // Circular ring wraparound
+    }
+    return entry.getValue();
+}
+```
+- **Thread Safety**: The ring is fully constructed and populated in the constructor and becomes immutable thereafter. Reads require no synchronization or locks.
+- **Fail-Fast Validation**: Requires non-null, non-empty `shardIds`, `virtualNodes > 0`, and non-blank `topic` strings.
+
+---
+
+### 3.3 Sharded Ingestion Pipeline (`ShardedProducerBatch` & `ProducerBatch`)
+
+The [`ShardedProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ShardedProducerBatch.java) implements [`IProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/IProducerBatch.java) and routes incoming write requests to dedicated per-shard [`ProducerBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/ProducerBatch.java) instances.
 
 ```mermaid
 flowchart LR
-    RPC["gRPC Enqueue Request"] -->|"enqueueAsync"| Q["ArrayBlockingQueue(EnqueueTask)<br/>Capacity: bufferCapacity"]
-    Q -->|"Check size >= batchSizeThreshold"| Trigger["triggerFlushAsync()"]
-    Trigger -->|"CAS isFlushing (false to true)"| Exec["SingleThreadScheduledExecutor<br/>ProducerBatch-Flusher"]
-    Exec -->|"drainTo batch"| BatchInsert["SingleShardQueueRepository<br/>enqueueBatch(tasks)"]
-    BatchInsert -->|"PreparedStatement.executeBatch"| DB[("MySQL InnoDB")]
-    BatchInsert -->|"future.complete(messageId)"| Future["CompletableFuture(UUID)"]
-    Future -->|"onNext"| Resp["EnqueueResponseDto"]
+    RPC["gRPC Enqueue Request"] -->|"enqueueAsync"| SPB["ShardedProducerBatch"]
+    SPB -->|"shardRouter.selectShard(topic)"| Router["ShardRouter"]
+    Router -->|"Target Shard ID"| SPB
+    SPB -->|"batch.enqueueAsync"| PB["ProducerBatch (Shard X)"]
+    PB -->|"writeBuffer.offer"| Q["ArrayBlockingQueue<br/>(Buffer per Shard)"]
+    Q -->|"Threshold reached OR Timer"| Flusher["Flusher Worker (Shard X)"]
+    Flusher -->|"JDBC executeBatch"| DB[("MySQL Shard X")]
 ```
 
 #### Key Mechanics:
-1. **Non-blocking Handoff**: `enqueueAsync(request)` wraps the payload into an `EnqueueTask` containing a `CompletableFuture<UUID>` and offers it to an in-memory `ArrayBlockingQueue`.
-2. **Dual-Trigger Flushing**:
-   - **Size-Trigger**: When the queue depth reaches `batchSizeThreshold` (default: 100), `triggerFlushAsync()` uses an `AtomicBoolean isFlushing` CAS guard to trigger an immediate batch flush on the flusher executor.
-   - **Time-Trigger**: A background scheduled executor periodically calls `safeFlushAll()` every `flushIntervalMs` (default: 10 ms) to guarantee maximum latency bounds during low-traffic periods.
-3. **Backpressure**: If the write buffer becomes full (`writeBuffer.offer(...) == false`), the service fails the future with a `RejectedExecutionException`, translating into a `Status.RESOURCE_EXHAUSTED` gRPC error to protect memory.
+1. **Independent Shard Buffering**: Each shard maintains its own `ArrayBlockingQueue` write buffer and dedicated scheduled flusher thread. A traffic spike or slow database on Shard 0 will **never** stall, delay, or block writes destined for Shard 1 or Shard 2.
+2. **Dual-Trigger Batching per Shard**:
+   - **Size-Trigger**: When an individual shard's queue depth reaches `batchSizeThreshold` (default: 100), it triggers an immediate batch flush for that shard.
+   - **Time-Trigger**: Periodic flush every `flushIntervalMs` (default: 10ms) guarantees tight latency bounds during low-traffic periods.
+3. **Safe Asynchronous Handoff**: If a request contains an invalid topic or targets an unconfigured shard, `ShardedProducerBatch` immediately returns a `CompletableFuture.failedFuture(...)` without throwing unhandled exceptions on caller threads.
+4. **Clean Lifecycle Management**: Calling `close()` traverses all underlying shard batches and uses `Throwable.addSuppressed()` so that a failure closing one shard does not abort closing remaining shards.
 
 ---
 
-### 3.3 Consumption Pipeline (`PrefetchBatch` & `PrefetchBufferRegistry`)
+### 3.4 Sharded Consumption Pipeline (`PrefetchBufferRegistry` & `PrefetchBatch`)
 
-To eliminate latency spikes on consumer dequeue calls, [`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) maintains an in-memory priority min-heap per topic.
+To provide instant in-memory dequeuing across multiple shards, [`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) binds each topic to a dedicated in-memory [`PrefetchBatch`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBatch.java) connected to the topic's designated database shard.
 
 ```mermaid
 flowchart TD
-    Consumer["Consumer gRPC Dequeue"] -->|"pollBatch(count, timeout)"| Heap["PriorityBlockingQueue(Message)<br/>Min-Heap: Priority ASC, ID ASC"]
+    Consumer["Consumer gRPC Dequeue (topic)"] -->|"pollBatch(count, timeout)"| Registry["PrefetchBufferRegistry"]
+    Registry -->|"computeIfAbsent(topic)"| Lookup["Lookup Cache"]
+    Lookup -.->|"First Access: selectShard(topic)"| Router["ShardRouter"]
+    Router -.->|"Shard Repository"| Repo["ISingleShardQueueRepository (Shard X)"]
+    Repo -.->|"Create"| PBatch["PrefetchBatch (Topic-Scoped)"]
+    PBatch -->|"pollBatch"| Heap["PriorityBlockingQueue(Message)<br/>Min-Heap: Priority ASC, ID ASC"]
     Heap -->|"Messages available"| Return["Return DequeueResponseDto"]
-    Heap -->|"Heap size < targetCapacity / 2"| LowWatermark["Low Watermark Trigger"]
-    LowWatermark -->|"Async Replenish"| Worker["foqs-prefetch worker"]
-    Timer["Fixed Delay Refill Timer (50ms)"] -->|"Periodic Replenish"| Worker
-    Worker -->|"SELECT ... FOR UPDATE + UPDATE status=1"| MySQL[("MySQL queue_messages")]
-    MySQL -->|"Leased Messages List"| Heap
+    Heap -->|"Heap size < targetCapacity / 2"| Worker["Replenish Worker"]
+    Worker -->|"SELECT ... FOR UPDATE + UPDATE status=1"| MySQL[("MySQL Shard X")]
 ```
 
 #### Key Mechanics:
-1. **Topic Buffer Registry**: [`PrefetchBufferRegistry`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/PrefetchBufferRegistry.java) uses a `ConcurrentHashMap` to lazily create and cache `PrefetchBatch` instances per topic.
-2. **Min-Heap Structure**: Uses a `PriorityBlockingQueue<Message>` with comparator:
-   ```java
-   Comparator.comparingInt(Message::getPriority)
-             .thenComparing(Message::getId)
-   ```
-3. **Low-Watermark Auto-Replenish**: During `pollBatch()`, if remaining heap items fall below `targetCapacity / 2`, the replenish worker is triggered immediately to refill from the database in the background.
-4. **Timeout-Aware Polling**: When consumers request messages with a timeout, `pollBatch()` polls the min-heap with high-resolution nanosecond deadlines, returning immediately once the requested batch size is satisfied or the deadline expires.
+1. **Dynamic Shard Resolution**: On the first dequeue request for a topic, `PrefetchBufferRegistry` queries `shardRouter.selectShard(topic)` to retrieve the corresponding shard's repository. If the shard is not configured in the cluster, an informative `IllegalStateException` is thrown immediately.
+2. **Fast In-Memory Path**: Subsequent dequeue calls for the same topic hit the `ConcurrentHashMap` cache and pull from `PrefetchBatch`'s priority min-heap in $O(1)$ without touching `ShardRouter` or the database.
+3. **Low-Watermark Background Replenishment**: When a topic's min-heap drops below `targetCapacity / 2`, a background worker replenishes the buffer by leasing the highest-priority ready rows (`status = 0`, `deliver_after <= NOW()`) from the target shard database.
 
 ---
 
-### 3.4 Storage Layer (`SingleShardQueueRepository`)
+### 3.5 Cross-Shard Scatter-Gather ACK & NACK Operations (`DequeueService`)
 
-[`SingleShardQueueRepository`](foqs-core/src/main/java/project/khaihust/foqs/core/storage/SingleShardQueueRepository.java) executes atomic JDBC queries against MySQL shards.
+Because consumer acknowledgment requests (`BatchAckRequestDto` and `BatchNackRequestDto`) supply a list of message UUIDs without topic names, [`DequeueService`](foqs-core/src/main/java/project/khaihust/foqs/core/service/DequeueService.java) executes **scatter-gather coordination** across all configured shard repositories:
+
+#### 1. Scatter-Gather `batchAck`:
+```java
+var remaining = new LinkedHashSet<>(incomingUuids);
+var allAcked = new ArrayList<UUID>();
+
+for (var repo : shardQueueRepositories.values()) {
+    if (remaining.isEmpty()) {
+        break; // Short-circuit once all messages are acknowledged
+    }
+    var acked = repo.ackMessages(new ArrayList<>(remaining));
+    allAcked.addAll(acked);
+    remaining.removeAll(new HashSet<>(acked)); // O(1) hash removal
+}
+```
+- **Ordering & Deduplication**: Uses `LinkedHashSet` to preserve request order and eliminate duplicates.
+- **Short-Circuit Optimization**: If all requested IDs are acknowledged by earlier shards, remaining shards are skipped entirely.
+- **Aggregated Response**: Successfully acknowledged UUIDs are placed in `acked_message_ids`; any unresolved IDs are returned in `failed_message_ids`.
+
+#### 2. Scatter-Gather `batchNack`:
+- Dispatches `repo.nackMessages(messageIds, retryDelayMs, maxRetryCount)` across all shard repositories.
+- Aggregates updated row counts and returns the unified `success_count`.
+
+---
+
+### 3.6 Storage Layer (`SingleShardQueueRepository`)
+
+[`SingleShardQueueRepository`](foqs-core/src/main/java/project/khaihust/foqs/core/storage/SingleShardQueueRepository.java) executes atomic JDBC queries against individual MySQL shards.
 
 | Operation | SQL Pattern / Logic | Description |
 | :--- | :--- | :--- |
@@ -208,26 +295,27 @@ flowchart TD
 | **`leaseMessages`** | `SELECT id, topic, priority, payload, status, deliver_after, lease_until, retry_count, created_at FROM queue_messages WHERE topic = ? AND status = 0 AND deliver_after <= ? ORDER BY priority ASC, id ASC LIMIT ? FOR UPDATE` followed by `UPDATE queue_messages SET status = 1, lease_until = ? WHERE id IN (...)` | Runs in an explicit transaction (`conn.setAutoCommit(false)`) to atomically claim and lock candidate messages. |
 | **`ackMessages`** | `SELECT id FROM queue_messages WHERE status = 1 AND id IN (...) FOR UPDATE` followed by `UPDATE queue_messages SET status = 2, lease_until = NULL WHERE id IN (...)` | Only acknowledges messages currently in `LEASED` status; committed atomically. |
 | **`nackMessages`** | `UPDATE queue_messages SET status = CASE WHEN retry_count + 1 >= ? THEN 3 ELSE 0 END, lease_until = NULL, deliver_after = ?, retry_count = retry_count + 1 WHERE status = 1 AND id IN (...)` | Conditionally transitions to `DEAD_LETTER (3)` or `READY (0)` with future `deliver_after` backoff. |
-| **`reclaimExpiredLeases`** | `UPDATE queue_messages SET status = 0, lease_until = NULL, retry_count = retry_count + 1 WHERE status = 1 AND lease_until < ?` | Resets abandoned leases back to `READY` status. |
+| **`reclaimExpiredLeases`** | `UPDATE queue_messages SET status = 0, lease_until = NULL, retry_count = retry_count + 1 WHERE status = 1 AND lease_until < ? LIMIT 1000` | Resets abandoned leases back to `READY` status with a `LIMIT 1000` batch cap to prevent locking tables during high backlog. |
 
 ---
 
-### 3.5 Background Recovery Daemon (`LeaseReclaimer`)
+### 3.7 Background Recovery Daemon (`LeaseReclaimer`)
 
 [`LeaseReclaimer`](foqs-core/src/main/java/project/khaihust/foqs/core/buffer/impl/LeaseReclaimer.java) runs as a singleton daemon scheduled executor (`foqs-lease-reclaimer`) configured with `reclaimerIntervalSeconds` (default: 1 second).
 
-- Scans the covered index `idx_reclaim (status, lease_until)` for rows where `status = 1` and `lease_until < NOW(3)`.
-- Resets them to `status = 0` (`READY`), clears `lease_until = NULL`, and increments `retry_count = retry_count + 1`.
-- Prevents message loss when consumer worker processes crash, deadlock, or suffer hardware failure mid-execution.
+- **Multi-Shard Sweep**: Iterates through all configured shard repositories (`shardQueueRepositories.values()`).
+- **Fault Isolation**: Sweeps each shard repository inside an isolated `try-catch` block. If Shard 0 experiences a network partition or query timeout, Shard 1 and Shard 2 continue to be reclaimed without interruption.
+- **Index-Covered Reset**: Uses `idx_reclaim (status, lease_until)` with `LIMIT 1000` to reset expired leases (`status = 1`, `lease_until < NOW(3)`) back to `READY (0)`.
 
 ---
 
-### 3.6 Multi-Shard DataSource Manager (`DatasourceManager`)
+### 3.8 Multi-Shard DataSource Manager (`DatasourceManager`)
 
 [`DatasourceManager`](foqs-core/src/main/java/project/khaihust/foqs/core/config/DatasourceManager.java) initializes and maintains a collection of high-performance `HikariDataSource` connection pools keyed by shard index (`0 .. N-1`).
 
 - Supports horizontal scaling across independent MySQL database shards.
 - Manages connection pool properties (maximum pool size, timeout, keepalive, connection leak detection).
+- Provides graceful shutdown to drain active transactions on all shards before process exit.
 
 ---
 
@@ -254,7 +342,7 @@ stateDiagram-v2
 
 ---
 
-### 3.2 State Transition Matrix
+### 4.2 State Transition Matrix
 
 | From State | Event / Trigger | Guard Condition | To State | Modifications to Record |
 | :--- | :--- | :--- | :--- | :--- |
@@ -267,9 +355,9 @@ stateDiagram-v2
 
 ---
 
-## 4. Database Schema, Indexing & Storage Engine
+## 5. Database Schema, Indexing & Storage Engine
 
-### 4.1 DDL Specification
+### 5.1 DDL Specification
 
 ```sql
 CREATE TABLE IF NOT EXISTS queue_messages (
@@ -290,10 +378,10 @@ CREATE TABLE IF NOT EXISTS queue_messages (
 
 ---
 
-### 4.2 Index Design & Query Optimization Analysis
+### 5.2 Index Design & Query Optimization Analysis
 
 #### 1. Composite Index: `idx_fetch_priority (topic, status, deliver_after, priority ASC, id ASC)`
-- **Purpose**: Powers the prefetch query:
+- **Purpose**: Powers the prefetch query on each shard:
   ```sql
   SELECT id, topic, priority, payload, status, deliver_after, lease_until, retry_count, created_at 
   FROM queue_messages 
@@ -307,18 +395,19 @@ CREATE TABLE IF NOT EXISTS queue_messages (
   3. `priority ASC, id ASC` provides a deterministic sorted order directly from the BTREE without requiring an in-memory or on-disk `Using filesort`.
 
 #### 2. Composite Index: `idx_reclaim (status, lease_until)`
-- **Purpose**: Powers the background recovery query:
+- **Purpose**: Powers the background recovery query on each shard:
   ```sql
   UPDATE queue_messages 
   SET status = 0, lease_until = NULL, retry_count = retry_count + 1 
-  WHERE status = 1 AND lease_until < ?;
+  WHERE status = 1 AND lease_until < ?
+  LIMIT 1000;
   ```
 - **How It Works**:
   Filters immediately to active leases (`status = 1`) and scans only expired timestamps, avoiding full table scans.
 
 ---
 
-### 4.3 Binary UUID (16-byte) vs String UUID (36-byte) Storage
+### 5.3 Binary UUID (16-byte) vs String UUID (36-byte) Storage
 
 FOQS utilizes `UUIDUtil.asByteArray(uuid)` and `UUIDUtil.uuid(bytes)`:
 
@@ -332,24 +421,30 @@ FOQS utilizes `UUIDUtil.asByteArray(uuid)` and `UUIDUtil.uuid(bytes)`:
 
 ---
 
-## 5. End-to-End Workflows & Sequence Diagrams
+## 6. End-to-End Workflows & Sequence Diagrams
 
-### 5.1 Enqueue Workflow (Micro-batching & Backpressure)
+### 6.1 Multi-Shard Enqueue Workflow (`ShardRouter` & Micro-batching)
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Producer
     participant ES as EnqueueService
-    participant PB as ProducerBatch
-    participant Flusher as Flusher Worker
-    participant DB as MySQL Shard
+    participant SPB as ShardedProducerBatch
+    participant SR as ShardRouter
+    participant PB as ProducerBatch (Shard X)
+    participant Flusher as Flusher Worker (Shard X)
+    participant DB as MySQL Shard X
 
     Producer->>ES: EnqueueRequestDto(topic, priority, payload, deliver_after)
-    ES->>PB: enqueueAsync(EnqueueRequest)
+    ES->>SPB: enqueueAsync(EnqueueRequest)
+    SPB->>SR: selectShard(topic)
+    SR-->>SPB: shardId = X
+    SPB->>PB: shardBatches.get(X).enqueueAsync(request)
     
-    alt Buffer Full (Backpressure)
-        PB-->>ES: CompletableFuture failed (RejectedExecutionException)
+    alt Buffer Full on Shard X (Backpressure)
+        PB-->>SPB: CompletableFuture failed (RejectedExecutionException)
+        SPB-->>ES: CompletableFuture failed
         ES-->>Producer: gRPC Status.RESOURCE_EXHAUSTED
     else Buffer Has Capacity
         PB->>PB: writeBuffer.offer(EnqueueTask)
@@ -365,32 +460,43 @@ sequenceDiagram
             Flusher->>PB: task.future.complete(messageId)
         end
         
-        PB-->>ES: CompletableFuture resolves UUID
+        PB-->>SPB: CompletableFuture resolves UUID
+        SPB-->>ES: CompletableFuture resolves UUID
         ES-->>Producer: EnqueueResponseDto(message_id)
     end
 ```
 
 ---
 
-### 5.2 Prefetch & Dequeue Workflow (In-Memory Min-Heap)
+### 6.2 Sharded Prefetch & Dequeue Workflow (In-Memory Min-Heap)
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Consumer
     participant DS as DequeueService
-    participant PB as PrefetchBatch
+    participant Reg as PrefetchBufferRegistry
+    participant SR as ShardRouter
+    participant PB as PrefetchBatch (Topic-Scoped)
     participant Heap as Min-Heap (PriorityBlockingQueue)
     participant Worker as Replenisher Worker
-    participant DB as MySQL Shard
+    participant DB as MySQL Shard X
 
+    Consumer->>DS: DequeueRequestDto(topic, count=10, timeout=1000ms)
+    DS->>Reg: getOrCreateBuffer(topic)
+    opt Topic not in cache
+        Reg->>SR: selectShard(topic)
+        SR-->>Reg: shardId = X
+        Reg->>Reg: create PrefetchBatch(topic, repoShardX)
+    end
+    Reg-->>DS: PrefetchBatch instance
+    
     Note over Worker: Background loop (50ms interval or low-watermark)
     Worker->>DB: SELECT ... WHERE topic=? AND status=0 FOR UPDATE
     Worker->>DB: UPDATE ... SET status=1, lease_until=NOW+30s
     DB-->>Worker: Leased Message Records
     Worker->>Heap: minHeap.addAll(messages)
 
-    Consumer->>DS: DequeueRequestDto(topic, count=10, timeout=1000ms)
     DS->>PB: pollBatch(count=10, timeout=1000ms)
     
     loop Draining Heap
@@ -408,85 +514,97 @@ sequenceDiagram
 
 ---
 
-### 5.3 Message Acknowledgment Workflow (`BatchAck`)
+### 6.3 Cross-Shard Scatter-Gather Acknowledgment (`BatchAck`)
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Consumer
     participant DS as DequeueService
-    participant Repo as SingleShardQueueRepository
-    participant DB as MySQL Shard
+    participant S0 as Repo Shard 0
+    participant S1 as Repo Shard 1
+    participant S2 as Repo Shard 2
 
-    Consumer->>DS: BatchAckRequestDto([uuid1, uuid2, uuid3])
+    Consumer->>DS: BatchAckRequestDto([idA (Shard 0), idB (Shard 1), idC (unknown)])
     
     alt Invalid UUID String
         DS-->>Consumer: gRPC Status.INVALID_ARGUMENT
     else Valid UUIDs
-        DS->>Repo: ackMessages([uuid1, uuid2, uuid3])
-        Repo->>DB: SELECT id FROM queue_messages WHERE status=1 FOR UPDATE
-        DB-->>Repo: Locked IDs ([uuid1, uuid2])
-        Repo->>DB: UPDATE queue_messages SET status=2, lease_until=NULL
-        DB-->>Repo: Commit Transaction
-        Repo-->>DS: Confirmed UUIDs ([uuid1, uuid2])
+        Note over DS: remaining = [idA, idB, idC]
+        DS->>S0: ackMessages([idA, idB, idC])
+        S0-->>DS: acked = [idA]
+        Note over DS: allAcked.add(idA); remaining.remove(idA) -> remaining = [idB, idC]
         
-        DS->>DS: failedIds = [uuid3]
-        DS-->>Consumer: BatchAckResponseDto([uuid1, uuid2], failed=[uuid3])
+        DS->>S1: ackMessages([idB, idC])
+        S1-->>DS: acked = [idB]
+        Note over DS: allAcked.add(idB); remaining.remove(idB) -> remaining = [idC]
+        
+        DS->>S2: ackMessages([idC])
+        S2-->>DS: acked = []
+        
+        DS-->>Consumer: BatchAckResponseDto(acked=[idA, idB], failed=[idC])
     end
 ```
 
 ---
 
-### 5.4 Negative Acknowledgment & DLQ Workflow (`BatchNack`)
+### 6.4 Cross-Shard Scatter-Gather Negative Acknowledgment (`BatchNack`)
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Consumer
     participant DS as DequeueService
-    participant Repo as SingleShardQueueRepository
-    participant DB as MySQL Shard
+    participant S0 as Repo Shard 0
+    participant S1 as Repo Shard 1
+    participant S2 as Repo Shard 2
 
-    Consumer->>DS: BatchNackRequestDto([uuid1, uuid2], retry_delay=5s, max_retries=3)
+    Consumer->>DS: BatchNackRequestDto([idA, idB], retry_delay=5s, max_retries=3)
     
-    DS->>Repo: nackMessages([uuid1, uuid2], 5000ms, 3)
+    DS->>S0: nackMessages([idA, idB], 5000ms, 3)
+    S0-->>DS: updatedCount = 1 (idA on Shard 0)
     
-    Note over Repo,DB: Evaluates retry_count + 1 against maxRetries
-    Repo->>DB: UPDATE queue_messages SET status, lease_until=NULL, deliver_after=NOW+5s
-    DB-->>Repo: Rows Affected Count (2)
-    Repo-->>DS: updatedCount = 2
+    DS->>S1: nackMessages([idA, idB], 5000ms, 3)
+    S1-->>DS: updatedCount = 1 (idB on Shard 1)
     
+    DS->>S2: nackMessages([idA, idB], 5000ms, 3)
+    S2-->>DS: updatedCount = 0
+    
+    Note over DS: totalSuccess = 1 + 1 + 0 = 2
     DS-->>Consumer: BatchNackResponseDto(success_count=2)
 ```
 
 ---
 
-### 5.5 Consumer Crash & Automated Lease Recovery Workflow
+### 6.5 Multi-Shard Fault-Isolated Lease Recovery Workflow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Consumer
-    participant DB as MySQL Shard
     participant Reclaimer as LeaseReclaimer Daemon
+    participant DB0 as MySQL Shard 0
+    participant DB1 as MySQL Shard 1 (Partitioned / Slow)
+    participant DB2 as MySQL Shard 2
 
-    Consumer->>DB: Message leased (status = 1, lease_until = T0 + 30s)
-    Note over Consumer: Consumer crashes / Network disconnects
-    Note over DB: Time progresses past lease_until (T0 + 31s)
-    
-    loop Periodic Scan Every 1s
-        Reclaimer->>DB: UPDATE queue_messages SET status = 0, lease_until = NULL, retry_count = retry_count + 1 WHERE status = 1 AND lease_until < NOW(3)
-        DB-->>Reclaimer: Rows reclaimed (status reset to READY 0)
+    loop Scheduled Every 1s
+        Reclaimer->>DB0: UPDATE queue_messages SET status=0 WHERE status=1 AND lease_until < NOW() LIMIT 1000
+        DB0-->>Reclaimer: Success: 15 rows reclaimed
+        
+        Note over Reclaimer,DB1: Isolated try-catch block
+        Reclaimer->>DB1: UPDATE queue_messages ... (Connection Timeout)
+        DB1--xReclaimer: SQLException (Logged at ERROR, isolated)
+        
+        Reclaimer->>DB2: UPDATE queue_messages SET status=0 WHERE status=1 AND lease_until < NOW() LIMIT 1000
+        DB2-->>Reclaimer: Success: 8 rows reclaimed
     end
-    
-    Note over DB: Message is immediately re-eligible for prefetching by other healthy workers
+    Note over Reclaimer: Shards 0 & 2 continue uninterrupted despite Shard 1 outage
 ```
 
 ---
 
-## 6. Complete gRPC API Reference
+## 7. Complete gRPC API Reference
 
-### 6.1 Protocol Buffers Definition
+### 7.1 Protocol Buffers Definition
 
 #### `enqueue.proto`
 ```protobuf
@@ -572,7 +690,7 @@ message BatchNackResponseDto {
 
 ---
 
-### 6.2 `EnqueueService.Enqueue`
+### 7.2 `EnqueueService.Enqueue`
 
 Publishes a message to a designated topic.
 
@@ -595,7 +713,7 @@ Publishes a message to a designated topic.
 
 ---
 
-### 6.3 `DequeueService.Dequeue`
+### 7.3 `DequeueService.Dequeue`
 
 Polls and leases a batch of messages from the topic's in-memory priority queue.
 
@@ -629,9 +747,9 @@ Polls and leases a batch of messages from the topic's in-memory priority queue.
 
 ---
 
-### 6.4 `DequeueService.BatchAck`
+### 7.4 `DequeueService.BatchAck`
 
-Acknowledges successful message processing, transitioning messages from `LEASED (1)` to `COMPLETED (2)`.
+Acknowledges successful message processing, transitioning messages from `LEASED (1)` to `COMPLETED (2)`. Automatically scatters across all configured database shards.
 
 - **RPC Method**: `project.khaihust.foqs.core.proto.DequeueService/BatchAck`
 
@@ -639,20 +757,20 @@ Acknowledges successful message processing, transitioning messages from `LEASED 
 
 | Field | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `message_ids` | `repeated string` | **Yes** | List of UUID strings to acknowledge. |
+| `message_ids` | `repeated string` | **Yes** | List of UUID strings to acknowledge (can belong to multiple shards). |
 
 #### Response (`BatchAckResponseDto`)
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `acked_message_ids` | `repeated string` | UUIDs successfully verified in `LEASED` status and transitioned to `COMPLETED`. |
-| `failed_message_ids`| `repeated string` | UUIDs that could not be ACKed (already completed, lease expired, unleased, or non-existent). |
+| `acked_message_ids` | `repeated string` | UUIDs successfully verified in `LEASED` status across shards and transitioned to `COMPLETED`. |
+| `failed_message_ids`| `repeated string` | UUIDs that could not be ACKed on any shard (already completed, lease expired, unleased, or non-existent). |
 
 ---
 
-### 6.5 `DequeueService.BatchNack`
+### 7.5 `DequeueService.BatchNack`
 
-Negatively acknowledges messages, allowing for retry backoff or DLQ routing.
+Negatively acknowledges messages, allowing for retry backoff or DLQ routing across all configured shards.
 
 - **RPC Method**: `project.khaihust.foqs.core.proto.DequeueService/BatchNack`
 
@@ -668,11 +786,11 @@ Negatively acknowledges messages, allowing for retry backoff or DLQ routing.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `success_count` | `int32` | Total number of rows successfully updated (rescheduled or moved to DLQ). |
+| `success_count` | `int32` | Total number of rows successfully updated across all shards (rescheduled or moved to DLQ). |
 
 ---
 
-### 6.6 Error Handling & Status Codes
+### 7.6 Error Handling & Status Codes
 
 | gRPC Status Code | Triggering Condition | Corrective Client Action |
 | :--- | :--- | :--- |
@@ -683,9 +801,9 @@ Negatively acknowledges messages, allowing for retry backoff or DLQ routing.
 
 ---
 
-## 7. Client Usage Examples
+## 8. Client Usage Examples
 
-### 7.1 Java gRPC Client Example
+### 8.1 Java gRPC Client Example
 
 ```java
 package com.example.client;
@@ -759,7 +877,7 @@ public class FoqsClientExample {
 
 ---
 
-### 7.2 `grpcurl` CLI Examples
+### 8.2 `grpcurl` CLI Examples
 
 #### Enqueue Message:
 ```bash
@@ -798,9 +916,9 @@ grpcurl -plaintext -d '{
 
 ---
 
-## 8. Configuration & Deployment Guide
+## 9. Configuration & Deployment Guide
 
-### 8.1 Configuration Properties Reference
+### 9.1 Configuration Properties Reference
 
 Configuration is loaded from `application.properties` and profile files (e.g. `application-local.properties`, `application-prod.properties`):
 
@@ -808,23 +926,23 @@ Configuration is loaded from `application.properties` and profile files (e.g. `a
 | :--- | :--- | :--- |
 | `foqs.profile` | `local` | Active configuration profile (`local`, `prod`, `test`). |
 | `foqs.server.port` | `8080` | Listening port for the gRPC server (`0` for random port in tests). |
-| `foqs.producer.bufferCapacity` | `10000` | In-memory `ArrayBlockingQueue` capacity for incoming enqueue requests. |
-| `foqs.producer.batchThreshold` | `100` | Number of messages accumulated before triggering an immediate batch insert. |
+| `foqs.producer.bufferCapacity` | `10000` | In-memory `ArrayBlockingQueue` capacity for incoming enqueue requests per shard. |
+| `foqs.producer.batchThreshold` | `100` | Number of messages accumulated before triggering an immediate batch insert per shard. |
 | `foqs.producer.flushIntervalMs`| `10` | Maximum wait time in milliseconds before flushing pending enqueue buffers. |
 | `foqs.prefetch.targetCapacity` | `1000` | In-memory min-heap target size maintained per topic. |
 | `foqs.prefetch.leaseDurationSeconds` | `30` | Duration in seconds granted to a leased message. |
 | `foqs.prefetch.refillIntervalMs` | `50` | Frequency in milliseconds of the background prefetch replenish check. |
-| `foqs.reclaimer.intervalSeconds` | `1` | Interval in seconds for the background lease recovery daemon. |
-| `foqs.shards.count` | `1` | Number of configured database shards. |
-| `foqs.shards.<index>.url` | — | JDBC connection URL for shard `<index>`. |
+| `foqs.reclaimer.intervalSeconds` | `1` | Interval in seconds for the background multi-shard lease recovery daemon. |
+| `foqs.shards.count` | `3` | Number of configured database shards (default: 3 in local profile). |
+| `foqs.shards.<index>.url` | — | JDBC connection URL for shard `<index>` (e.g. `jdbc:mysql://localhost:3306/foqs_shard_0`). |
 | `foqs.shards.<index>.username` | `root` | Database username for shard `<index>`. |
 | `foqs.shards.<index>.password` | `root` | Database password for shard `<index>`. |
 
 ---
 
-### 8.2 Docker Compose Quickstart
+### 9.2 Docker Compose Quickstart (3-Shard Cluster)
 
-The [`docker/docker-compose.yml`](docker/docker-compose.yml) starts the default MySQL 8.0 shard container:
+The [`docker/docker-compose.yml`](docker/docker-compose.yml) starts the 3 MySQL 8.0 shard containers (`foqs-mysql-shard-0`, `foqs-mysql-shard-1`, `foqs-mysql-shard-2`):
 
 ```yaml
 version: '3.8'
@@ -839,16 +957,47 @@ services:
     ports:
       - "3306:3306"
     command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - foqs-shard-0-data:/var/lib/mysql
+
+  mysql-shard-1:
+    image: mysql:8.0
+    container_name: foqs-mysql-shard-1
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: foqs_shard_1
+    ports:
+      - "3307:3306"
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - foqs-shard-1-data:/var/lib/mysql
+
+  mysql-shard-2:
+    image: mysql:8.0
+    container_name: foqs-mysql-shard-2
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: foqs_shard_2
+    ports:
+      - "3308:3306"
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - foqs-shard-2-data:/var/lib/mysql
+
+volumes:
+  foqs-shard-0-data:
+  foqs-shard-1-data:
+  foqs-shard-2-data:
 ```
 
-Start the container:
+Start the 3-shard cluster:
 ```bash
 docker compose -f docker/docker-compose.yml up -d
 ```
 
 ---
 
-### 8.3 Liquibase Database Migration
+### 9.3 Liquibase Database Migration
 
 FOQS uses **Liquibase** for database versioning located in `foqs-migration`:
 
@@ -859,7 +1008,7 @@ mvn clean compile exec:java -pl foqs-migration -Dexec.mainClass="project.khaihus
 
 ---
 
-### 8.4 Production Tuning Recommendations
+### 9.4 Production Tuning Recommendations
 
 1. **MySQL InnoDB Buffer Pool**:
    - Allocate 70–80% of total host RAM to `innodb_buffer_pool_size` to ensure `idx_fetch_priority` and `queue_messages` reside completely in memory.

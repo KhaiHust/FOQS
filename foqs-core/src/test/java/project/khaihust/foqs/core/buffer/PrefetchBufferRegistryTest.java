@@ -53,4 +53,67 @@ class PrefetchBufferRegistryTest {
 
         assertThatCode(() -> registry.close()).doesNotThrowAnyException();
     }
+
+    @Test
+    @DisplayName("Should route different topics to respective shard repositories in multi-shard mode")
+    void testMultiShardRouting() {
+        var shardRouter = new project.khaihust.foqs.core.config.ShardRouter(java.util.List.of(0, 1), 64);
+        var repo0 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+        var repo1 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+
+        registry = new PrefetchBufferRegistry(
+                shardRouter,
+                java.util.Map.of(0, repo0, 1, repo1),
+                100,
+                Duration.ofSeconds(30),
+                1000
+        );
+
+        String topicFor0 = null;
+        String topicFor1 = null;
+        int idx = 0;
+        while (topicFor0 == null || topicFor1 == null) {
+            String candidate = "topic-" + idx++;
+            int shard = shardRouter.selectShard(candidate);
+            if (shard == 0 && topicFor0 == null) topicFor0 = candidate;
+            else if (shard == 1 && topicFor1 == null) topicFor1 = candidate;
+        }
+
+        PrefetchBatch buffer0 = registry.getOrCreateBuffer(topicFor0);
+        PrefetchBatch buffer1 = registry.getOrCreateBuffer(topicFor1);
+
+        assertThat(buffer0).isNotNull();
+        assertThat(buffer1).isNotNull();
+        assertThat(buffer0).isNotSameAs(buffer1);
+    }
+
+    @Test
+    @DisplayName("Should throw IllegalStateException when topic routes to unconfigured shard")
+    void testMissingShardRepository() {
+        var shardRouter = new project.khaihust.foqs.core.config.ShardRouter(java.util.List.of(0, 1), 64);
+        var repo0 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+
+        // Only shard 0 is configured, shard 1 is missing
+        registry = new PrefetchBufferRegistry(
+                shardRouter,
+                java.util.Map.of(0, repo0),
+                100,
+                Duration.ofSeconds(30),
+                1000
+        );
+
+        String topicFor1 = null;
+        int idx = 0;
+        while (topicFor1 == null) {
+            String candidate = "topic-" + idx++;
+            if (shardRouter.selectShard(candidate) == 1) {
+                topicFor1 = candidate;
+            }
+        }
+
+        final String missingTopic = topicFor1;
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> registry.getOrCreateBuffer(missingTopic))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("No repository configured for shard: 1");
+    }
 }

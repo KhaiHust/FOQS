@@ -61,4 +61,37 @@ class LeaseReclaimerTest {
         assertThatCode(() -> leaseReclaimer.close())
                 .doesNotThrowAnyException();
     }
+
+    @Test
+    @DisplayName("Should reclaim expired leases across all configured repositories in multi-shard mode")
+    void testMultiRepositoryReclaim() throws SQLException {
+        ISingleShardQueueRepository repo0 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+        ISingleShardQueueRepository repo1 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+
+        when(repo0.reclaimExpiredLeases()).thenReturn(2);
+        when(repo1.reclaimExpiredLeases()).thenReturn(5);
+
+        leaseReclaimer = new LeaseReclaimer(java.util.List.of(repo0, repo1), 60);
+        leaseReclaimer.reclaimLease();
+
+        verify(repo0).reclaimExpiredLeases();
+        verify(repo1).reclaimExpiredLeases();
+    }
+
+    @Test
+    @DisplayName("Should isolate exceptions so failure in one repository does not abort others")
+    void testMultiRepositoryExceptionIsolation() throws SQLException {
+        ISingleShardQueueRepository repo0 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+        ISingleShardQueueRepository repo1 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+
+        doThrow(new SQLException("Shard 0 connection lost")).when(repo0).reclaimExpiredLeases();
+        when(repo1.reclaimExpiredLeases()).thenReturn(3);
+
+        leaseReclaimer = new LeaseReclaimer(java.util.List.of(repo0, repo1), 60);
+
+        assertThatCode(() -> leaseReclaimer.reclaimLease()).doesNotThrowAnyException();
+
+        verify(repo0).reclaimExpiredLeases();
+        verify(repo1).reclaimExpiredLeases();
+    }
 }

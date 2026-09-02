@@ -7,4 +7,6 @@ import java.util.concurrent.CompletableFuture;
 
 public interface IProducerBatch {
     CompletableFuture<UUID> enqueueAsync(EnqueueRequest enqueueRequest);
+
+    void close() throws Exception;
 }

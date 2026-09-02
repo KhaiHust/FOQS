@@ -12,13 +12,17 @@ import org.slf4j.LoggerFactory;
 import project.khaihust.foqs.core.buffer.impl.LeaseReclaimer;
 import project.khaihust.foqs.core.buffer.impl.PrefetchBufferRegistry;
 import project.khaihust.foqs.core.buffer.impl.ProducerBatch;
+import project.khaihust.foqs.core.buffer.impl.ShardedProducerBatch;
 import project.khaihust.foqs.core.config.DatasourceManager;
+import project.khaihust.foqs.core.config.ShardRouter;
 import project.khaihust.foqs.core.service.DequeueService;
 import project.khaihust.foqs.core.service.EnqueueService;
+import project.khaihust.foqs.core.storage.ISingleShardQueueRepository;
 import project.khaihust.foqs.core.storage.SingleShardQueueRepository;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -32,11 +36,12 @@ public class Application {
     private static final Integer DEFAULT_LEASE_DURATION_SECONDS = 30;
     private static final Integer DEFAULT_REFILL_INTERVAL_MS = 1000;
     private static final Integer DEFAULT_RECLAIMER_INTERVAL_SECONDS = 5;
+    private static final Integer DEFAULT_VIRTUAL_NODE = 128;
 
     @Getter
     private final Server server;
     @Getter
-    private final ProducerBatch producerBatch;
+    private final ShardedProducerBatch producerBatch;
     @Getter
     private final PrefetchBufferRegistry prefetchBufferRegistry;
     @Getter
@@ -47,6 +52,9 @@ public class Application {
     private final EnqueueService enqueueService;
     @Getter
     private final DequeueService dequeueService;
+
+    @Getter
+    private final ShardRouter shardRouter;
 
     private final int configuredPort;
 
@@ -93,30 +101,39 @@ public class Application {
                        List<ShardConfig> shardConfigs) {
         this.configuredPort = port;
         this.datasourceManager = new DatasourceManager(shardConfigs);
-        var shardDatasource = this.datasourceManager.getDataSource(0);
-        var singleShardQueueRepository = new SingleShardQueueRepository(shardDatasource);
 
-        this.producerBatch = new ProducerBatch(
-                singleShardQueueRepository,
+        var shardIds = shardConfigs.stream().map(ShardConfig::getShardId).toList();
+        this.shardRouter = new ShardRouter(shardIds, DEFAULT_VIRTUAL_NODE);
+
+        var shardRepositories = new HashMap<Integer, ISingleShardQueueRepository>();
+
+        for(int shardId : shardIds){
+            shardRepositories.put(shardId, new SingleShardQueueRepository(this.datasourceManager.getDataSource(shardId)));
+        }
+
+        this.producerBatch = new ShardedProducerBatch(
+                this.shardRouter,
+                shardRepositories,
                 bufferCapacity,
                 batchThreshold,
                 flushIntervalMs
         );
 
         this.prefetchBufferRegistry = new PrefetchBufferRegistry(
-                singleShardQueueRepository,
+                shardRouter,
+                shardRepositories,
                 prefetchTargetCapacity,
                 prefetchLeaseDuration,
                 prefetchRefillIntervalMs
         );
 
         this.leaseReclaimer = new LeaseReclaimer(
-                singleShardQueueRepository,
+                shardRepositories.values(),
                 reclaimerIntervalSeconds
         );
 
         this.enqueueService = new EnqueueService(this.producerBatch);
-        this.dequeueService = new DequeueService(this.prefetchBufferRegistry, singleShardQueueRepository);
+        this.dequeueService = new DequeueService(this.prefetchBufferRegistry, shardRepositories);
 
         this.server = ServerBuilder.forPort(port)
                 .addService(this.enqueueService)

@@ -125,6 +125,7 @@ public class SingleShardQueueRepository implements ISingleShardQueueRepository {
             UPDATE queue_messages 
             SET status = 0, lease_until = NULL, retry_count = retry_count + 1 
             WHERE status = 1 AND lease_until < ?
+            LIMIT 1000
         """;
 
         try (var conn = dataSource.getConnection();

@@ -397,4 +397,67 @@ class DequeueServiceTest {
         StatusRuntimeException sre = (StatusRuntimeException) error;
         assertThat(sre.getStatus().getCode()).isEqualTo(Status.Code.INTERNAL);
     }
+
+    @Test
+    @DisplayName("Should successfully scatter-gather ack across multiple shards")
+    void testBatchAck_MultiShard() throws Exception {
+        ISingleShardQueueRepository repo0 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+        ISingleShardQueueRepository repo1 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+
+        DequeueService multiShardService = new DequeueService(prefetchBufferRegistry, java.util.Map.of(0, repo0, 1, repo1));
+
+        UUID idOnShard0 = UUID.randomUUID();
+        UUID idOnShard1 = UUID.randomUUID();
+        UUID idNotFound = UUID.randomUUID();
+
+        when(repo0.ackMessages(any())).thenAnswer(inv -> {
+            List<UUID> ids = inv.getArgument(0);
+            return ids.contains(idOnShard0) ? List.of(idOnShard0) : List.of();
+        });
+        when(repo1.ackMessages(any())).thenAnswer(inv -> {
+            List<UUID> ids = inv.getArgument(0);
+            return ids.contains(idOnShard1) ? List.of(idOnShard1) : List.of();
+        });
+
+        BatchAckRequestDto request = BatchAckRequestDto.newBuilder()
+                .addMessageIds(idOnShard0.toString())
+                .addMessageIds(idOnShard1.toString())
+                .addMessageIds(idNotFound.toString())
+                .build();
+
+        multiShardService.batchAck(request, batchAckResponseObserver);
+
+        verify(batchAckResponseObserver).onNext(batchAckResponseCaptor.capture());
+        verify(batchAckResponseObserver).onCompleted();
+
+        BatchAckResponseDto response = batchAckResponseCaptor.getValue();
+        assertThat(response.getAckedMessageIdsList()).containsExactlyInAnyOrder(idOnShard0.toString(), idOnShard1.toString());
+        assertThat(response.getFailedMessageIdsList()).containsExactly(idNotFound.toString());
+    }
+
+    @Test
+    @DisplayName("Should aggregate success counts across all shards during batch nack")
+    void testBatchNack_MultiShard() throws Exception {
+        ISingleShardQueueRepository repo0 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+        ISingleShardQueueRepository repo1 = org.mockito.Mockito.mock(ISingleShardQueueRepository.class);
+
+        DequeueService multiShardService = new DequeueService(prefetchBufferRegistry, java.util.Map.of(0, repo0, 1, repo1));
+
+        when(repo0.nackMessages(any(), anyLong(), anyInt())).thenReturn(2);
+        when(repo1.nackMessages(any(), anyLong(), anyInt())).thenReturn(3);
+
+        BatchNackRequestDto request = BatchNackRequestDto.newBuilder()
+                .addMessageIds(UUID.randomUUID().toString())
+                .setRetryDelayMs(500L)
+                .setMaxRetryCount(3)
+                .build();
+
+        multiShardService.batchNack(request, batchNackResponseObserver);
+
+        verify(batchNackResponseObserver).onNext(batchNackResponseCaptor.capture());
+        verify(batchNackResponseObserver).onCompleted();
+
+        BatchNackResponseDto response = batchNackResponseCaptor.getValue();
+        assertThat(response.getSuccessCount()).isEqualTo(5);
+    }
 }

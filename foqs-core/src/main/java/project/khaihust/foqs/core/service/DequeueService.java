@@ -11,14 +11,18 @@ import project.khaihust.foqs.core.proto.*;
 import project.khaihust.foqs.core.storage.ISingleShardQueueRepository;
 
 import java.time.Duration;
-import java.util.HashSet;
-import java.util.UUID;
+import java.util.*;
+
 @Slf4j
 @RequiredArgsConstructor
 public class DequeueService extends DequeueServiceGrpc.DequeueServiceImplBase {
     private static final int DEFAULT_MAX_RETRIES = 5;
     private final IPrefetchBufferRegistry prefetchBufferRegistry;
-    private final ISingleShardQueueRepository  singleShardQueueRepository;
+    private final Map<Integer, ISingleShardQueueRepository> shardQueueRepositories;
+
+    public DequeueService(IPrefetchBufferRegistry prefetchBufferRegistry, ISingleShardQueueRepository singleRepo) {
+        this(prefetchBufferRegistry, Map.of(0, singleRepo));
+    }
 
     @Override
     public void batchAck(BatchAckRequestDto request, StreamObserver<BatchAckResponseDto> responseObserver) {
@@ -27,20 +31,21 @@ public class DequeueService extends DequeueServiceGrpc.DequeueServiceImplBase {
                     .map(UUID::fromString)
                     .toList();
 
-            var successfulUuids = singleShardQueueRepository.ackMessages(incomingUuids);
+            var remaining = new LinkedHashSet<>(incomingUuids);
+            var allAcked = new ArrayList<UUID>();
 
-            var successSet = new HashSet<>(successfulUuids);
-            var failedIds = incomingUuids.stream()
-                    .filter(id -> !successSet.contains(id))
-                    .map(UUID::toString)
-                    .toList();
+            for (var repo : shardQueueRepositories.values()) {
+                if (remaining.isEmpty()) {
+                    break;
+                }
 
-            var ackMessageIds = successfulUuids.stream()
-                    .map(UUID::toString)
-                    .toList();
+                var acked = repo.ackMessages(new ArrayList<>(remaining));
+                allAcked.addAll(acked);
+                remaining.removeAll(new HashSet<>(acked));
+            }
             var response = BatchAckResponseDto.newBuilder()
-                    .addAllAckedMessageIds(ackMessageIds)
-                    .addAllFailedMessageIds(failedIds)
+                    .addAllAckedMessageIds(allAcked.stream().map(UUID::toString).toList())
+                    .addAllFailedMessageIds(remaining.stream().map(UUID::toString).toList())
                     .build();
 
             responseObserver.onNext(response);
@@ -65,8 +70,10 @@ public class DequeueService extends DequeueServiceGrpc.DequeueServiceImplBase {
             var retryDelayMs = request.getRetryDelayMs();
             var maxRetryCount = request.getMaxRetryCount() <= 0 ? DEFAULT_MAX_RETRIES : request.getMaxRetryCount();
 
-            var updatedCount = singleShardQueueRepository.nackMessages(messageIds, retryDelayMs, maxRetryCount);
-
+            var updatedCount = 0;
+            for (var repo : shardQueueRepositories.values()) {
+                updatedCount += repo.nackMessages(messageIds, retryDelayMs, maxRetryCount);
+            }
             responseObserver.onNext(BatchNackResponseDto.newBuilder()
                     .setSuccessCount(updatedCount)
                     .build());
